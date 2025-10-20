@@ -1,621 +1,672 @@
-"""
-LAN File Transfer — functional, robust version
-- PIN generated on receiver (expires after PIN_TTL_SECONDS)
-- salt is broadcast together with device info while PIN is valid
-- sender reads salt from discovery info and enters PIN manually
-- AES-GCM encryption with key derived from PIN+salt (PBKDF2)
-- Files sent in 64 KiB chunks
-- Progress bar + status messages
-- timezone-aware datetimes (no utcnow())
-"""
-
-import os
 import socket
 import threading
-import json
 import time
-import uuid
+import os
+import sys
 import struct
-import base64
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from queue import Queue, Empty
+import hashlib
+import queue
+from tkinter import Listbox, END
+import customtkinter as ctk
 
-import tkinter as tk
-from tkinter import messagebox, filedialog
+# ==========================
+# Config simple
+# ==========================
+APP_NAME = "Fishare"
+ADVERTISING_PORT = 50000          # UDP broadcast pentru advertising
+TRANSFER_PORT = 50010             # TCP server pentru transfer
+ADVERTISING_INTERVAL = 1.0        # secunde
+SCAN_CLEANUP_SECONDS = 10         # sterge device-urile inactive
+CHUNK_SIZE = 64 * 1024            # 64KB
+PIN_ROTATE_SECONDS = 180          # 3 minute
+AES_NONCE_SIZE = 12               # AES-GCM standard
+UI_REFRESH_MS = 500               # tick UI
+SALT = b"FishareSaltV1"           # salt fix pentru derivarea cheii din PIN
 
+# ==========================
+# Cryptography (AES-GCM)
+# ==========================
 try:
-    import customtkinter as ctk
-except Exception as e:
-    print("Please install customtkinter: pip install customtkinter")
-    raise
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.backends import default_backend
+except ImportError:
+    print("E nevoie de cryptography: pip install cryptography")
+    sys.exit(1)
 
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.backends import default_backend
-import secrets
-
-# ---------------- Configuration ----------------
-UDP_PORT = 50000
-TCP_PORT = 50010
-BCAST_INTERVAL = 1.0           # seconds between broadcasts
-DEVICE_CLEANUP = 5.0           # seconds to consider device removed
-CHUNK_SIZE = 64 * 1024         # 64 KiB
-PIN_TTL_SECONDS = 120          # PIN validity
-RECV_DIR = Path("received_files")
-RECV_DIR.mkdir(exist_ok=True)
-
-LOCAL_ID = str(uuid.uuid4())
-HOSTNAME = socket.gethostname()
-
-# ---------------- Helpers ----------------
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-def derive_key(pin_bytes: bytes, salt: bytes, length: int = 32) -> bytes:
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=length,
-        salt=salt,
-        iterations=200_000,
-        backend=default_backend()
-    )
+def derive_key_from_pin(pin_str: str) -> bytes:
+    """
+    Deriva o cheie AES-256 (32 bytes) din PIN-ul dinamic + SALT, prin PBKDF2-HMAC-SHA256.
+    Iteratii moderate pentru MVP.
+    """
+    pin_bytes = pin_str.encode("utf-8")
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=SALT, iterations=100_000, backend=default_backend())
     return kdf.derive(pin_bytes)
 
-def encrypt_payload(plaintext: bytes, key: bytes) -> bytes:
-    aes = AESGCM(key)
-    nonce = secrets.token_bytes(12)
-    ct = aes.encrypt(nonce, plaintext, None)
-    return nonce + ct
+def aesgcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
+    """
+    AES-GCM: encrypt returns ciphertext + tag concatenat.
+    Protocol: trimitem [len 4B big-endian][cipher_with_tag]
+    """
+    aesgcm = AESGCM(key)
+    return aesgcm.encrypt(nonce, plaintext, aad if aad else None)
 
-def decrypt_payload(payload: bytes, key: bytes) -> bytes:
-    aes = AESGCM(key)
-    nonce = payload[:12]
-    ct = payload[12:]
-    return aes.decrypt(nonce, ct, None)
+def aesgcm_decrypt(key: bytes, nonce: bytes, cipher_with_tag: bytes, aad: bytes = b"") -> bytes:
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, cipher_with_tag, aad if aad else None)
 
-def send_frame(sock: socket.socket, data: bytes):
-    sock.sendall(struct.pack("!Q", len(data)) + data)
+# ==========================
+# PIN dinamic (seed + timp)
+# ==========================
+"""
+Elimina “secret” global. Utilizatorul introduce un PIN seed (de ex. 6-8 cifre).
+PIN-ul dinamic afisat/folosit se calculeaza determinist la fiecare fereastra de 3 minute:
 
-def recv_all(sock: socket.socket, n: int):
-    buf = b''
+dynamic_pin = SHA256(seed + ":" + window_index) % 1_000_000 (6 cifre)
+
+Astfel, ambele device-uri care au același seed și timp rezonabil sincronizat
+vor avea același PIN dinamic în fereastra curentă. Cheia AES se derivă din PIN-ul dinamic + SALT.
+"""
+
+def current_window_index() -> int:
+    return int(time.time() // PIN_ROTATE_SECONDS)
+
+def dynamic_pin(seed: str) -> str:
+    win_idx = current_window_index()
+    data = f"{seed}:{win_idx}".encode("utf-8")
+    digest = hashlib.sha256(data).digest()
+    pin6 = int.from_bytes(digest[:4], "big") % 1_000_000
+    return f"{pin6:06d}"
+
+def seconds_until_next_window() -> int:
+    now = int(time.time())
+    return PIN_ROTATE_SECONDS - (now % PIN_ROTATE_SECONDS)
+
+# ==========================
+# Protocol
+# ==========================
+"""
+TCP Protocol:
+
+Handshake:
+Client -> Server:
+  [magic "FSHR" 4B][proto_ver 1B=1][session_nonce 12B][pin_window_index 8B]
+Server -> Client:
+  [magic "FSOK" 4B]
+
+Pentru fiecare fișier:
+Header (AES-GCM, AAD="FILEHDR", nonce=make_nonce):
+  Plaintext:
+    [name_len 2B][name ...][file_size 8B]
+Trimitem: [len 4B][cipher_with_tag]
+
+Chunk-uri (AES-GCM, AAD="FILECHK"):
+  Plaintext:
+    [offset 8B][data]
+Trimitem: [len 4B][cipher_with_tag]
+
+Final (AES-GCM, AAD="FILEEND"):
+  Plaintext:
+    [file_size 8B]
+Trimitem: [len 4B][cipher_with_tag]
+
+Nonce per pachet: derivat din session_nonce si counter monoton.
+"""
+
+MAGIC_REQ = b"FSHR"
+MAGIC_OK = b"FSOK"
+PROTOCOL_VERSION = 1
+
+def make_nonce(session_nonce: bytes, counter: int) -> bytes:
+    # 12 bytes total: primii 8 = XOR(session_nonce[:8], counter_be), ultimii 4 = session_nonce[8:12]
+    counter_bytes = struct.pack(">Q", counter)
+    p8 = bytes(a ^ b for a, b in zip(session_nonce[:8], counter_bytes))
+    return p8 + session_nonce[8:12]
+
+# ==========================
+# Advertising / Scan
+# ==========================
+def get_local_hostname():
+    try:
+        return socket.gethostname()
+    except:
+        return "unknown"
+
+def get_local_ip_for_broadcast():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+def advertising_loop(stop_event: threading.Event, name: str):
+    ip = get_local_ip_for_broadcast()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    msg_base = f"{APP_NAME}|{name}|{ip}|{TRANSFER_PORT}".encode("utf-8")
+    while not stop_event.is_set():
+        try:
+            sock.sendto(msg_base, ("255.255.255.255", ADVERTISING_PORT))
+        except Exception:
+            pass
+        time.sleep(ADVERTISING_INTERVAL)
+    sock.close()
+
+def scan_loop(stop_event: threading.Event, devices: dict, devices_lock: threading.Lock, events_q: queue.Queue):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", ADVERTISING_PORT))
+    except Exception:
+        for p in range(ADVERTISING_PORT, ADVERTISING_PORT + 10):
+            try:
+                sock.bind(("", p))
+                break
+            except:
+                continue
+    sock.settimeout(0.5)
+    last_cleanup = time.time()
+    while not stop_event.is_set():
+        try:
+            data, addr = sock.recvfrom(1024)
+            text = data.decode("utf-8", errors="ignore")
+            parts = text.split("|")
+            if len(parts) == 4 and parts[0] == APP_NAME:
+                name = parts[1]
+                ip = parts[2]
+                port = int(parts[3])
+                with devices_lock:
+                    devices[(ip, port)] = {"name": name, "last": time.time()}
+                events_q.put(("devices_updated", None))
+        except socket.timeout:
+            pass
+        except Exception:
+            pass
+
+        # cleanup
+        if time.time() - last_cleanup > 2:
+            with devices_lock:
+                now = time.time()
+                to_del = [k for k, v in devices.items() if now - v["last"] > SCAN_CLEANUP_SECONDS]
+                for k in to_del:
+                    del devices[k]
+            last_cleanup = time.time()
+    sock.close()
+
+# ==========================
+# TCP server (primire)
+# ==========================
+def ensure_received_dir():
+    try:
+        os.makedirs("received", exist_ok=True)
+    except Exception:
+        pass
+
+def tcp_server_loop(stop_event: threading.Event, pin_seed_getter, events_q: queue.Queue):
+    ensure_received_dir()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("", TRANSFER_PORT))
+    srv.listen(5)
+    srv.settimeout(0.5)
+
+    def handle_client(conn, addr):
+        try:
+            hdr = conn.recv(4 + 1 + AES_NONCE_SIZE + 8)
+            if len(hdr) < (4 + 1 + AES_NONCE_SIZE + 8):
+                conn.close()
+                return
+            magic = hdr[:4]
+            ver = hdr[4]
+            session_nonce = hdr[5:5+AES_NONCE_SIZE]
+            pin_window_index = struct.unpack(">Q", hdr[5+AES_NONCE_SIZE:5+AES_NONCE_SIZE+8])[0]
+            if magic != MAGIC_REQ or ver != PROTOCOL_VERSION:
+                conn.close()
+                return
+
+            # Derivam PIN dinamic din seed-ul local (acelasi pe ambele, ideal)
+            seed = pin_seed_getter()
+            pin_val = dynamic_pin(seed)
+            key = derive_key_from_pin(pin_val)
+
+            conn.sendall(MAGIC_OK)
+
+            counter = 1
+            while True:
+                # Header fisier: [len 4B][cipher_with_tag]
+                raw = recvall(conn, 4)
+                if not raw:
+                    break
+                clen = struct.unpack(">I", raw)[0]
+                cipher = recvall(conn, clen)
+                if cipher is None or len(cipher) < clen:
+                    break
+
+                nonce = make_nonce(session_nonce, counter)
+                counter += 1
+                try:
+                    pt = aesgcm_decrypt(key, nonce, cipher, b"FILEHDR")
+                except Exception:
+                    break
+
+                # parse header
+                if len(pt) < 2 + 8:
+                    break
+                name_len = struct.unpack(">H", pt[:2])[0]
+                if len(pt) < 2 + name_len + 8:
+                    break
+                name = pt[2:2+name_len].decode("utf-8", errors="ignore")
+                file_size = struct.unpack(">Q", pt[2+name_len:2+name_len+8])[0]
+
+                safe_name = os.path.basename(name)
+                out_path = os.path.join("received", safe_name)
+                f = open(out_path, "wb")
+                received = 0
+                events_q.put(("receive_started", {"name": safe_name, "size": file_size}))
+
+                # chunks
+                while received < file_size:
+                    raw = recvall(conn, 4)
+                    if not raw:
+                        break
+                    clen = struct.unpack(">I", raw)[0]
+                    cipher = recvall(conn, clen)
+                    if cipher is None or len(cipher) < clen:
+                        break
+                    nonce = make_nonce(session_nonce, counter)
+                    counter += 1
+                    try:
+                        pt = aesgcm_decrypt(key, nonce, cipher, b"FILECHK")
+                    except Exception:
+                        break
+                    if len(pt) < 8:
+                        break
+                    offset = struct.unpack(">Q", pt[:8])[0]
+                    data = pt[8:]
+                    if offset != received:
+                        f.close()
+                        try:
+                            os.remove(out_path)
+                        except:
+                            pass
+                        break
+                    f.write(data)
+                    received += len(data)
+                    events_q.put(("receive_progress", {"name": safe_name, "received": received, "size": file_size}))
+
+                # final
+                raw = recvall(conn, 4)
+                if not raw:
+                    f.close()
+                    continue
+                clen = struct.unpack(">I", raw)[0]
+                cipher = recvall(conn, clen)
+                if cipher is None or len(cipher) < clen:
+                    f.close()
+                    continue
+                nonce = make_nonce(session_nonce, counter)
+                counter += 1
+                try:
+                    pt = aesgcm_decrypt(key, nonce, cipher, b"FILEEND")
+                except Exception:
+                    f.close()
+                    continue
+                if len(pt) < 8:
+                    f.close()
+                    continue
+                end_size = struct.unpack(">Q", pt[:8])[0]
+                f.flush()
+                f.close()
+                if end_size != received:
+                    try:
+                        os.remove(out_path)
+                    except:
+                        pass
+                    events_q.put(("receive_failed", {"name": safe_name}))
+                else:
+                    events_q.put(("receive_done", {"name": safe_name, "size": received}))
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+    while not stop_event.is_set():
+        try:
+            conn, addr = srv.accept()
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t.start()
+        except socket.timeout:
+            pass
+        except Exception:
+            pass
+    srv.close()
+
+def recvall(conn, n) -> bytes:
+    buf = b""
     while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
+        chunk = conn.recv(n - len(buf))
         if not chunk:
-            return None
+            return None if len(buf) == 0 else buf
         buf += chunk
     return buf
 
-def recv_frame(sock: socket.socket):
-    header = recv_all(sock, 8)
-    if not header:
-        return None
-    length = struct.unpack("!Q", header)[0]
-    if length == 0:
-        return b''
-    return recv_all(sock, length)
+# ==========================
+# Client TCP (trimitere)
+# ==========================
+def send_files(host: str, port: int, files: list, pin_seed_getter, events_q: queue.Queue):
+    paths = [p for p in files if os.path.isfile(p)]
+    if not paths:
+        return
 
-def unique_path(p: Path) -> Path:
-    if not p.exists():
-        return p
-    stem = p.stem
-    suffix = p.suffix
-    i = 1
-    while True:
-        candidate = p.with_name(f"{stem}_{i}{suffix}")
-        if not candidate.exists():
-            return candidate
-        i += 1
+    session_nonce = os.urandom(AES_NONCE_SIZE)
+    seed = pin_seed_getter()
+    pin_val = dynamic_pin(seed)
+    key = derive_key_from_pin(pin_val)
+    pin_window_index = current_window_index()
 
-# ---------------- Discovery (advertise + listen) ----------------
-class Discovery(threading.Thread):
-    def __init__(self, device_queue: Queue, stop_event: threading.Event, receiver_ref=None):
-        super().__init__(daemon=True)
-        self.device_queue = device_queue
-        self.stop_event = stop_event
-        self.receiver_ref = receiver_ref  # optional, used to include salt while PIN active
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.listen_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.listen_sock.bind(("", UDP_PORT))
-        self.devices = {}  # id -> (info_dict, last_seen_ts)
-        self.lock = threading.Lock()
-
-    def run(self):
-        # start advertiser in separate thread
-        threading.Thread(target=self._advertise_loop, daemon=True).start()
-        while not self.stop_event.is_set():
-            try:
-                self.listen_sock.settimeout(1.0)
-                data, addr = self.listen_sock.recvfrom(4096)
-            except socket.timeout:
-                data = None
-            if data:
-                try:
-                    j = json.loads(data.decode('utf-8', errors='ignore'))
-                    dev_id = j.get('id')
-                    if dev_id and dev_id != LOCAL_ID:
-                        j['addr'] = addr[0]
-                        with self.lock:
-                            self.devices[dev_id] = (j, time.time())
-                        self.device_queue.put(('update', dev_id, j))
-                except Exception:
-                    pass
-            self._cleanup_devices()
-        try:
-            self.listen_sock.close()
-        except Exception:
-            pass
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-
-    def _advertise_loop(self):
-        while not self.stop_event.is_set():
-            payload = {
-                'id': LOCAL_ID,
-                'name': HOSTNAME,
-                'tcp_port': TCP_PORT,
-                'ts': now_iso()
-            }
-            # include salt if receiver has a currently valid PIN
-            try:
-                if self.receiver_ref:
-                    pin_state = self.receiver_ref.get_pin_state()
-                    if pin_state:
-                        _, salt, expiry = pin_state
-                        # check expiry using timezone-aware
-                        if expiry > datetime.now(timezone.utc):
-                            payload['salt'] = base64.b64encode(salt).decode('ascii')
-            except Exception:
-                pass
-            try:
-                self.sock.sendto(json.dumps(payload).encode('utf-8'), ('<broadcast>', UDP_PORT))
-            except Exception:
-                # ignore send errors (network down etc.)
-                pass
-            time.sleep(BCAST_INTERVAL)
-
-    def _cleanup_devices(self):
-        with self.lock:
-            dead = [d for d, (_, ts) in self.devices.items() if time.time() - ts > DEVICE_CLEANUP]
-            for d in dead:
-                del self.devices[d]
-                self.device_queue.put(('remove', d, None))
-
-    def get_devices_snapshot(self):
-        with self.lock:
-            return {k: v[0] for k, v in self.devices.items()}
-
-# ---------------- FileReceiver (server) ----------------
-class FileReceiver(threading.Thread):
-    def __init__(self, incoming_queue: Queue, stop_event: threading.Event):
-        super().__init__(daemon=True)
-        self.incoming_queue = incoming_queue
-        self.stop_event = stop_event
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("", TCP_PORT))
-        self.sock.listen(4)
-        # pin_state: (pin_str, salt_bytes, expiry_datetime_tzaware)
-        self.pin_state = None
-        self.pin_lock = threading.Lock()
-
-    def run(self):
-        while not self.stop_event.is_set():
-            try:
-                self.sock.settimeout(1.0)
-                conn, addr = self.sock.accept()
-            except socket.timeout:
-                continue
-            threading.Thread(target=self._handle_conn, args=(conn, addr), daemon=True).start()
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-
-    def generate_pin(self):
-        pin = f"{secrets.randbelow(10**6):06d}"
-        salt = secrets.token_bytes(16)
-        expiry = datetime.now(timezone.utc) + timedelta(seconds=PIN_TTL_SECONDS)
-        with self.pin_lock:
-            self.pin_state = (pin, salt, expiry)
-        return pin, salt, expiry
-
-    def clear_pin(self):
-        with self.pin_lock:
-            self.pin_state = None
-
-    def get_pin_state(self):
-        with self.pin_lock:
-            return self.pin_state
-
-    def _handle_conn(self, conn: socket.socket, addr):
-        try:
-            meta_bytes = recv_frame(conn)
-            if meta_bytes is None:
-                conn.close()
-                return
-            pin_state = self.get_pin_state()
-            # check pin exists and not expired
-            if not pin_state or pin_state[2] <= datetime.now(timezone.utc):
-                # tell sender the reason and close
-                try:
-                    conn.sendall(b'REJECT_NO_PIN')
-                except Exception:
-                    pass
-                conn.close()
-                return
-            pin, salt, expiry = pin_state
-            key = derive_key(pin.encode('utf-8'), salt)
-            # try to decrypt metadata; if decryption fails -> wrong pin on sender side
-            try:
-                meta_plain = decrypt_payload(meta_bytes, key)
-            except Exception:
-                # wrong encryption key (likely wrong PIN provided by sender)
-                try:
-                    conn.sendall(b'REJECT_BAD_PIN')
-                except Exception:
-                    pass
-                conn.close()
-                return
-            # parse metadata
-            try:
-                j = json.loads(meta_plain.decode('utf-8'))
-                filename = os.path.basename(j.get('filename', 'received.bin'))
-                filesize = int(j.get('filesize', 0))
-            except Exception:
-                conn.close()
-                return
-            tmp_path = RECV_DIR / (filename + '.part')
-            with open(tmp_path, 'wb') as f:
-                received = 0
-                while received < filesize:
-                    chunk_encrypted = recv_frame(conn)
-                    if not chunk_encrypted:
-                        break
-                    try:
-                        chunk = decrypt_payload(chunk_encrypted, key)
-                    except Exception:
-                        # decryption error mid-stream -> abort
-                        try:
-                            conn.sendall(b'REJECT_BAD_PIN')
-                        except Exception:
-                            pass
-                        conn.close()
-                        return
-                    f.write(chunk)
-                    received += len(chunk)
-            final_path = unique_path(RECV_DIR / filename)
-            tmp_path.rename(final_path)
-            # notify UI
-            self.incoming_queue.put(('received', str(final_path), filesize))
-            try:
-                conn.sendall(b'OK')
-            except Exception:
-                pass
+    try:
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn.settimeout(5)
+        conn.connect((host, port))
+        conn.sendall(MAGIC_REQ + bytes([PROTOCOL_VERSION]) + session_nonce + struct.pack(">Q", pin_window_index))
+        ok = recvall(conn, 4)
+        if ok != MAGIC_OK:
             conn.close()
-        except Exception as e:
-            # log for debug, but keep server alive
-            print("Receiver error:", e)
-            try:
-                conn.close()
-            except Exception:
-                pass
+            return
+        counter = 1
 
-# ---------------- FileSender ----------------
-class FileSender:
-    def send_files(self, remote_addr: str, remote_port: int, files: list, pin: str, salt: bytes, progress_callback=None):
-        """
-        Returns (True, None) on success or (False, error_str) on failure.
-        progress_callback expects a float between 0.0 and 1.0
-        """
+        for path in paths:
+            name = os.path.basename(path)
+            size = os.path.getsize(path)
+            events_q.put(("send_started", {"name": name, "size": size, "dest": f"{host}:{port}"}))
+            name_bytes = name.encode("utf-8")
+            hdr_pt = struct.pack(">H", len(name_bytes)) + name_bytes + struct.pack(">Q", size)
+            nonce = make_nonce(session_nonce, counter)
+            counter += 1
+            cipher = aesgcm_encrypt(key, nonce, hdr_pt, b"FILEHDR")
+            conn.sendall(struct.pack(">I", len(cipher)) + cipher)
+
+            sent = 0
+            with open(path, "rb") as f:
+                while sent < size:
+                    data = f.read(CHUNK_SIZE)
+                    if not data:
+                        break
+                    pt = struct.pack(">Q", sent) + data
+                    nonce = make_nonce(session_nonce, counter)
+                    counter += 1
+                    cipher = aesgcm_encrypt(key, nonce, pt, b"FILECHK")
+                    conn.sendall(struct.pack(">I", len(cipher)) + cipher)
+                    sent += len(data)
+                    events_q.put(("send_progress", {"name": name, "sent": sent, "size": size, "dest": f"{host}:{port}"}))
+
+            pt = struct.pack(">Q", size)
+            nonce = make_nonce(session_nonce, counter)
+            counter += 1
+            cipher = aesgcm_encrypt(key, nonce, pt, b"FILEEND")
+            conn.sendall(struct.pack(">I", len(cipher)) + cipher)
+            events_q.put(("send_done", {"name": name, "size": size, "dest": f"{host}:{port}"}))
+
+        conn.close()
+    except Exception:
         try:
-            key = derive_key(pin.encode('utf-8'), salt)
-        except Exception as e:
-            return False, f"Key derivation failed: {e}"
+            conn.close()
+        except:
+            pass
+        events_q.put(("send_failed", {"dest": f"{host}:{port}"}))
 
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(10)
-            s.connect((remote_addr, remote_port))
-        except Exception as e:
-            return False, f"Connect failed: {e}"
-
-        total_size = sum(os.path.getsize(p) for p in files)
-        sent_total = 0
-        try:
-            for path in files:
-                size = os.path.getsize(path)
-                meta = json.dumps({'filename': os.path.basename(path), 'filesize': size}).encode('utf-8')
-                send_frame(s, encrypt_payload(meta, key))
-                with open(path, 'rb') as f:
-                    while True:
-                        chunk = f.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        send_frame(s, encrypt_payload(chunk, key))
-                        sent_total += len(chunk)
-                        if progress_callback:
-                            try:
-                                progress_callback(min(1.0, sent_total / total_size))
-                            except Exception:
-                                pass
-            # wait for receiver ack (optional)
-            try:
-                s.settimeout(5.0)
-                resp = s.recv(32)
-                # some receivers send 'OK' or 'REJECT_*' messages
-                if resp and resp.startswith(b'REJECT'):
-                    return False, resp.decode('utf-8', errors='ignore')
-            except Exception:
-                # ignore ack timeout
-                pass
-            s.close()
-            return True, None
-        except Exception as e:
-            try:
-                s.close()
-            except Exception:
-                pass
-            return False, f"Send failed: {e}"
-
-# ---------------- GUI Application ----------------
-class App(ctk.CTk):
+# ==========================
+# UI (CustomTkinter) – mărită și clară
+# ==========================
+class FishareApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("LAN File Transfer")
-        self.geometry("860x540")
-        ctk.set_appearance_mode("light")
-        ctk.set_default_color_theme("blue")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+        self.title("Fishare - LAN File Transfer")
+        self.geometry("1024x700")
+        self.resizable(True, True)
 
-        # networking
+        # State
         self.stop_event = threading.Event()
-        self.device_queue = Queue()
-        self.incoming_queue = Queue()
-        # create receiver first (so Discovery can include its salt if any)
-        self.receiver = FileReceiver(self.incoming_queue, self.stop_event)
-        self.discovery = Discovery(self.device_queue, self.stop_event, receiver_ref=self.receiver)
-        self.sender = FileSender()
+        self.events_q = queue.Queue()
+        self.devices = {}
+        self.devices_lock = threading.Lock()
+        self.files = []
+        self.pin_seed = "123456"  # utilizatorul poate schimba
+        self.last_window_idx = current_window_index()
 
-        self.devices = {}  # id -> info dict
-        self.selected_device_id = None
-        self.files_to_send = []
+        # Titlu
+        self.top_label = ctk.CTkLabel(self, text="FISHARE", font=("Segoe UI", 34, "bold"))
+        self.top_label.pack(pady=(16, 10))
 
-        # build UI
-        self._build_ui()
+        # PIN seed + pin dinamic + countdown
+        pin_frame = ctk.CTkFrame(self)
+        pin_frame.pack(fill="x", padx=16, pady=(0, 12))
 
-        # start network threads
-        self.receiver.start()
-        self.discovery.start()
+        self.pin_seed_entry = ctk.CTkEntry(pin_frame, placeholder_text="PIN seed (ex. 6-8 cifre)", width=260, font=("Segoe UI", 18))
+        self.pin_seed_entry.insert(0, self.pin_seed)
+        self.pin_seed_entry.pack(side="left", padx=10, pady=10)
 
-        # start polling loop
-        self.after(200, self._poll_queues)
+        self.pin_set_btn = ctk.CTkButton(pin_frame, text="Set PIN seed", font=("Segoe UI", 18, "bold"), command=self.on_set_pin_seed)
+        self.pin_set_btn.pack(side="left", padx=10)
 
-    def _build_ui(self):
-        # LEFT: devices + PIN generation + PIN entry (for sender)
-        left = ctk.CTkFrame(self, width=300, corner_radius=8)
-        left.pack(side="left", fill="y", padx=12, pady=12)
+        self.pin_dynamic_label = ctk.CTkLabel(pin_frame, text=self.pin_dynamic_text(), font=("Segoe UI", 22, "bold"))
+        self.pin_dynamic_label.pack(side="left", padx=20)
 
-        ctk.CTkLabel(left, text="Devices on LAN", font=("Helvetica", 14, "bold")).pack(anchor="nw", padx=8, pady=(6,4))
-        self.listbox_frame = ctk.CTkFrame(left)
-        self.listbox_frame.pack(fill="both", expand=True, padx=8, pady=4)
-        self.listbox_tk = tk.Listbox(self.listbox_frame, height=12, font=("Segoe UI", 10))
-        self.listbox_tk.pack(fill="both", expand=True, padx=4, pady=4)
-        self.listbox_tk.bind("<<ListboxSelect>>", lambda e: self._on_device_select())
+        self.pin_timer_label = ctk.CTkLabel(pin_frame, text=self.pin_timer_text(), font=("Segoe UI", 18))
+        self.pin_timer_label.pack(side="left", padx=12)
 
-        self.lbl_selected = ctk.CTkLabel(left, text="Selected: —", anchor="w")
-        self.lbl_selected.pack(fill="x", padx=8, pady=(4,6))
+        # Zone principale
+        mid_frame = ctk.CTkFrame(self)
+        mid_frame.pack(fill="both", expand=True, padx=16, pady=10)
 
-        # Receiver: generate pin
-        pin_frame = ctk.CTkFrame(left)
-        pin_frame.pack(fill="x", padx=8, pady=6)
-        self.btn_gen_pin = ctk.CTkButton(pin_frame, text="Generate PIN (receiver)", command=self._generate_pin)
-        self.btn_gen_pin.pack(side="left", padx=(0,6), expand=True)
-        self.lbl_pin_timer = ctk.CTkLabel(pin_frame, text="PIN: —")
-        self.lbl_pin_timer.pack(side="left")
+        left_frame = ctk.CTkFrame(mid_frame)
+        left_frame.pack(side="left", fill="both", expand=True, padx=(10, 6), pady=10)
 
-        # Sender: entry to paste PIN shown on receiver (manual workflow)
-        pin_entry_frame = ctk.CTkFrame(left)
-        pin_entry_frame.pack(fill="x", padx=8, pady=(6,8))
-        ctk.CTkLabel(pin_entry_frame, text="Enter receiver PIN:").pack(side="left", padx=(0,6))
-        self.entry_pin = ctk.CTkEntry(pin_entry_frame, width=100, placeholder_text="123456")
-        self.entry_pin.pack(side="left")
+        right_frame = ctk.CTkFrame(mid_frame)
+        right_frame.pack(side="left", fill="both", expand=True, padx=(6, 10), pady=10)
 
-        # RIGHT: files, send controls, progress
-        right = ctk.CTkFrame(self, corner_radius=8)
-        right.pack(side="right", fill="both", expand=True, padx=12, pady=12)
+        # Devices
+        dev_title = ctk.CTkLabel(left_frame, text="Device-uri disponibile", font=("Segoe UI", 24, "bold"))
+        dev_title.pack(pady=(10, 6))
+        self.devices_list = Listbox(left_frame, height=16, font=("Segoe UI", 16), activestyle="none")
+        self.devices_list.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self.refresh_btn = ctk.CTkButton(left_frame, text="Refresh lista", font=("Segoe UI", 18, "bold"), command=self.refresh_devices_list)
+        self.refresh_btn.pack(pady=(0, 10))
 
-        ctk.CTkLabel(right, text="Files to send", font=("Helvetica", 16, "bold")).pack(anchor="nw", padx=8, pady=(6,4))
-        btn_bar = ctk.CTkFrame(right)
-        btn_bar.pack(fill="x", padx=8, pady=(4,6))
-        self.btn_add = ctk.CTkButton(btn_bar, text="Add files", command=self._add_files)
-        self.btn_add.pack(side="left", padx=6)
-        self.btn_remove = ctk.CTkButton(btn_bar, text="Remove", command=self._remove_file)
-        self.btn_remove.pack(side="left", padx=6)
-        self.btn_send = ctk.CTkButton(btn_bar, text="Send", command=self._send_files)
-        self.btn_send.pack(side="right", padx=6)
+        # Files
+        files_title = ctk.CTkLabel(right_frame, text="Fișiere de trimis", font=("Segoe UI", 24, "bold"))
+        files_title.pack(pady=(10, 6))
+        self.files_list = Listbox(right_frame, height=16, font=("Segoe UI", 16), activestyle="none")
+        self.files_list.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        files_frame = ctk.CTkFrame(right)
-        files_frame.pack(fill="both", expand=True, padx=8, pady=(4,6))
-        self.files_listbox = tk.Listbox(files_frame, height=12, font=("Segoe UI", 10), selectmode=tk.MULTIPLE)
-        self.files_listbox.pack(fill="both", expand=True, padx=4, pady=4)
+        files_btn_frame = ctk.CTkFrame(right_frame)
+        files_btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.add_file_btn = ctk.CTkButton(files_btn_frame, text="Adaugă fișiere", font=("Segoe UI", 18, "bold"), command=self.on_add_file)
+        self.add_file_btn.pack(side="left", padx=6)
+        self.clear_files_btn = ctk.CTkButton(files_btn_frame, text="Curăță lista", font=("Segoe UI", 18, "bold"), command=self.on_clear_files)
+        self.clear_files_btn.pack(side="left", padx=6)
 
-        # progress + status
-        self.progress = ctk.CTkProgressBar(right)
+        # Send
+        send_frame = ctk.CTkFrame(self)
+        send_frame.pack(fill="x", padx=16, pady=8)
+        self.send_btn = ctk.CTkButton(send_frame, text="Trimite către device selectat", font=("Segoe UI", 20, "bold"), command=self.on_send)
+        self.send_btn.pack(pady=10)
+
+        # Progress jos
+        bottom_frame = ctk.CTkFrame(self, fg_color="#002600")
+        bottom_frame.pack(fill="x", padx=0, pady=(6, 0))
+        self.progress_label = ctk.CTkLabel(bottom_frame, text="Progres transfer", font=("Segoe UI", 22, "bold"))
+        self.progress_label.pack(pady=(8, 4))
+        self.progress = ctk.CTkProgressBar(bottom_frame, height=20, progress_color="green")
+        self.progress.pack(fill="x", padx=16, pady=(0, 12))
         self.progress.set(0.0)
-        self.progress.pack(fill="x", padx=8, pady=(2,4))
-        self.status = ctk.CTkLabel(right, text="Status: ready")
-        self.status.pack(fill="x", padx=8, pady=(4,8))
 
-    # UI helpers
-    def _refresh_device_list(self):
-        # repopulate listbox from self.devices
-        self.listbox_tk.delete(0, tk.END)
-        for dev_id, info in self.devices.items():
-            name = info.get('name', 'unknown')
-            addr = info.get('addr', '?.?.?.?')
-            port = info.get('tcp_port', TCP_PORT)
-            # mark if salt present (PIN active)
-            salt_note = ' [PIN]' if info.get('salt') else ''
-            self.listbox_tk.insert(tk.END, f"{name} {addr}:{port}{salt_note} — {dev_id}")
+        # Status
+        self.status_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 18))
+        self.status_label.pack(pady=(6, 10))
 
-    def _on_device_select(self):
-        sel = self.listbox_tk.curselection()
-        if not sel:
-            self.selected_device_id = None
-            self.lbl_selected.configure(text="Selected: —")
-            return
-        text = self.listbox_tk.get(sel[0])
-        # last part after ' — ' is id
-        if ' — ' in text:
-            dev_id = text.split(' — ')[-1]
-            self.selected_device_id = dev_id
-            info = self.devices.get(dev_id, {})
-            addr = info.get('addr', '')
-            port = info.get('tcp_port', TCP_PORT)
-            self.lbl_selected.configure(text=f"Selected: {info.get('name','?')} @ {addr}:{port}")
+        # Threads
+        self.name = get_local_hostname()
+        self.stop_event.clear()
+        self.advertising_thread = threading.Thread(target=advertising_loop, args=(self.stop_event, self.name), daemon=True)
+        self.scan_thread = threading.Thread(target=scan_loop, args=(self.stop_event, self.devices, self.devices_lock, self.events_q), daemon=True)
+        self.server_thread = threading.Thread(target=tcp_server_loop, args=(self.stop_event, self.get_pin_seed, self.events_q), daemon=True)
 
-    def _generate_pin(self):
-        # generate pin on local receiver instance
-        pin, salt, expiry = self.receiver.generate_pin()
-        # update label and schedule timer updates via after
-        def update_timer():
-            ps = self.receiver.get_pin_state()
-            if not ps:
-                self.lbl_pin_timer.configure(text="PIN: —")
-                return
-            _, _, exp = ps
-            remaining = int((exp - datetime.now(timezone.utc)).total_seconds())
-            if remaining <= 0:
-                # expired; receiver.clear_pin() should already have been called by timer thread if used,
-                # but ensure label is updated
-                self.receiver.clear_pin()
-                self.lbl_pin_timer.configure(text="PIN: —")
-                # Discovery will stop advertising salt automatically in next broadcast
-                return
-            self.lbl_pin_timer.configure(text=f"PIN: {pin} ({remaining}s)")
-            # call again after 1s
-            self.after(1000, update_timer)
-        update_timer()
-        # Note: Discovery thread uses receiver_ref to include salt while PIN is valid
+        self.advertising_thread.start()
+        self.scan_thread.start()
+        self.server_thread.start()
 
-    def _add_files(self):
-        paths = filedialog.askopenfilenames(title="Select files to send")
-        if not paths:
-            return
-        for p in paths:
-            self.files_to_send.append(p)
-            self.files_listbox.insert(tk.END, p)
+        # UI ticks
+        self.after(UI_REFRESH_MS, self.ui_tick)
+        self.after(500, self.update_pin_display)
 
-    def _remove_file(self):
-        sel = list(self.files_listbox.curselection())
-        if not sel:
-            return
-        for idx in reversed(sel):
-            self.files_listbox.delete(idx)
-            del self.files_to_send[idx]
+        # Close
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def _send_files(self):
-        # validate selection and PIN
-        if not self.selected_device_id:
-            messagebox.showwarning("No device", "Please select a device to send to.")
+    # ----- PIN seed / afisari -----
+    def get_pin_seed(self) -> str:
+        return self.pin_seed
+
+    def on_set_pin_seed(self):
+        val = self.pin_seed_entry.get().strip()
+        if not val:
+            self.status("Introdu un PIN seed.")
             return
-        dev = self.devices.get(self.selected_device_id)
-        if not dev:
-            messagebox.showwarning("Device gone", "Selected device is not available anymore.")
-            return
-        if not self.files_to_send:
-            messagebox.showwarning("No files", "Please add files to send.")
-            return
-        pin = self.entry_pin.get().strip()
-        if not pin or len(pin) != 6 or not pin.isdigit():
-            messagebox.showwarning("Invalid PIN", "Please enter a 6-digit PIN provided by the receiver.")
-            return
-        # get salt from the discovered device info (must be present while receiver's PIN valid)
-        salt_b64 = dev.get('salt')
-        if not salt_b64:
-            # salt missing -> receiver did not broadcast salt (PIN not generated) or broadcast not received yet
-            messagebox.showwarning("Missing salt", "Receiver did not advertise a salt. Make sure receiver pressed Generate PIN and wait a moment.")
-            return
+        self.pin_seed = val
+        self.status("PIN seed setat. Folosește același seed pe ambele device-uri.")
+        self.update_pin_display()
+
+    def pin_dynamic_text(self) -> str:
+        return f"PIN: {dynamic_pin(self.pin_seed)}"
+
+    def pin_timer_text(self) -> str:
+        secs = seconds_until_next_window()
+        mm = secs // 60
+        ss = secs % 60
+        return f"Se schimbă în {mm:02d}:{ss:02d}"
+
+    def update_pin_display(self):
+        self.pin_dynamic_label.configure(text=self.pin_dynamic_text())
+        self.pin_timer_label.configure(text=self.pin_timer_text())
+        self.after(500, self.update_pin_display)  # live, din 0.5s
+
+    # ----- Files -----
+    def on_add_file(self):
         try:
-            salt = base64.b64decode(salt_b64)
-        except Exception as e:
-            messagebox.showerror("Salt error", f"Failed to decode salt from device info: {e}")
+            from tkinter import filedialog
+            paths = filedialog.askopenfilenames(title="Selectează fișiere")
+            if paths:
+                for p in paths:
+                    if os.path.isfile(p):
+                        self.files.append(p)
+                        self.files_list.insert(END, os.path.basename(p))
+                self.status(f"Adăugate {len(paths)} fișiere.")
+        except Exception:
+            self.status("Nu s-a putut deschide dialogul de fișiere.")
+
+    def on_clear_files(self):
+        self.files.clear()
+        self.files_list.delete(0, END)
+        self.status("Lista de fișiere a fost curățată.")
+
+    # ----- Devices -----
+    def refresh_devices_list(self):
+        with self.devices_lock:
+            items = [f"{v['name']} | {ip}:{port}" for (ip, port), v in self.devices.items()]
+        self.devices_list.delete(0, END)
+        for it in items:
+            self.devices_list.insert(END, it)
+
+    # ----- Send -----
+    def on_send(self):
+        sel = self.devices_list.curselection()
+        if not sel:
+            self.status("Selectează un device din listă.")
             return
+        item = self.devices_list.get(sel[0])
+        try:
+            right = item.split("|")[1].strip()
+            host, port_s = right.split(":")
+            port = int(port_s)
+        except Exception:
+            self.status("Intrare device invalidă.")
+            return
+        if not self.files:
+            self.status("Lista de fișiere e goală.")
+            return
+        t = threading.Thread(target=send_files, args=(host, port, self.files.copy(), self.get_pin_seed, self.events_q), daemon=True)
+        t.start()
+        self.status(f"Pornit transfer către {host}:{port}.")
 
-        # start sending in background thread and update progress
-        self.status.configure(text="Status: sending...")
-        self.progress.set(0.0)
-        files_copy = list(self.files_to_send)  # copy to avoid mutation during send
+    # ----- Events & tick -----
+    def status(self, msg: str):
+        self.status_label.configure(text=msg)
 
-        def progress_cb(frac: float):
-            # frac is 0.0..1.0
+    def ui_tick(self):
+        self.refresh_devices_list()
+        while True:
             try:
-                self.progress.set(frac)
-            except Exception:
-                pass
-
-        def send_thread():
-            success, err = self.sender.send_files(dev['addr'], dev['tcp_port'], files_copy, pin, salt, progress_callback=progress_cb)
-            if success:
-                self.status.configure(text=f"Status: sent {len(files_copy)} file(s) successfully")
-                # clear file list
-                self.files_listbox.delete(0, tk.END)
-                self.files_to_send.clear()
+                ev, data = self.events_q.get_nowait()
+            except queue.Empty:
+                break
+            if ev == "devices_updated":
+                self.refresh_devices_list()
+            elif ev == "send_started":
+                name = data["name"]; size = data["size"]; dest = data["dest"]
+                self.status(f"Trimit {name} ({size} bytes) către {dest}...")
+                self.progress.set(0.0)
+            elif ev == "send_progress":
+                name = data["name"]; sent = data["sent"]; size = data["size"]
+                pct = sent / size if size else 0
+                self.progress.set(pct)
+                self.status(f"{name}: {sent}/{size} bytes")
+            elif ev == "send_done":
+                name = data["name"]; size = data["size"]; dest = data["dest"]
                 self.progress.set(1.0)
-            else:
-                # map common REJECT_* responses
-                if isinstance(err, bytes):
-                    err_msg = err.decode('utf-8', errors='ignore')
-                else:
-                    err_msg = err or "unknown error"
-                if 'REJECT_BAD_PIN' in str(err_msg) or 'REJECT_BAD_PIN' in str(err):
-                    self.status.configure(text="Status: Error — wrong PIN (decryption failed on receiver)")
-                elif 'REJECT_NO_PIN' in str(err_msg) or 'REJECT_NO_PIN' in str(err):
-                    self.status.configure(text="Status: Error — receiver has no valid PIN (expired or not generated)")
-                else:
-                    self.status.configure(text=f"Status: Error — {err_msg}")
-            # reset progress bar slightly after done
-            time.sleep(0.6)
-            # keep at final state for a bit then reset to 0
-            time.sleep(0.4)
-            self.progress.set(0.0)
+                self.status(f"Trimis {name} ({size} bytes) către {dest}.")
+            elif ev == "send_failed":
+                dest = data["dest"]
+                self.status(f"Transfer către {dest} a eșuat.")
+                self.progress.set(0.0)
+            elif ev == "receive_started":
+                name = data["name"]; size = data["size"]
+                self.status(f"Primire {name} ({size} bytes)...")
+                self.progress.set(0.0)
+            elif ev == "receive_progress":
+                name = data["name"]; rec = data["received"]; size = data["size"]
+                pct = rec / size if size else 0
+                self.progress.set(pct)
+                self.status(f"{name}: {rec}/{size} bytes")
+            elif ev == "receive_done":
+                name = data["name"]; size = data["size"]
+                self.progress.set(1.0)
+                self.status(f"Primit {name} ({size} bytes). Saved în ./received")
+            elif ev == "receive_failed":
+                name = data["name"]
+                self.progress.set(0.0)
+                self.status(f"Primirea pentru {name} a eșuat.")
+        self.after(UI_REFRESH_MS, self.ui_tick)
 
-        threading.Thread(target=send_thread, daemon=True).start()
-
-    def _poll_queues(self):
-        # devices updates
+    def on_close(self):
         try:
-            while True:
-                typ, dev_id, info = self.device_queue.get_nowait()
-                if typ == 'update':
-                    self.devices[dev_id] = info
-                elif typ == 'remove':
-                    if dev_id in self.devices:
-                        del self.devices[dev_id]
-                # update UI list
-                self._refresh_device_list()
-        except Empty:
+            self.stop_event.set()
+        except:
             pass
+        self.after(200, self.destroy)
 
-        # incoming files
-        try:
-            while True:
-                typ, path, size = self.incoming_queue.get_nowait()
-                if typ == 'received':
-                    messagebox.showinfo("File received", f"Saved: {path} ({size} bytes)")
-        except Empty:
-            pass
-
-        # schedule next poll
-        self.after(200, self._poll_queues)
-
-# ----------------- Main -----------------
+# ==========================
+# Main
+# ==========================
 if __name__ == "__main__":
-    app = App()
-    app.protocol("WM_DELETE_WINDOW", lambda: (setattr(app, "stop_event", app.stop_event.set()) or app.destroy()))
+    app = FishareApp()
     app.mainloop()
