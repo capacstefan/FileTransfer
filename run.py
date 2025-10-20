@@ -293,17 +293,15 @@ class App(ctk.CTk):
         # PIN display for receiver
         pin_frame = ctk.CTkFrame(left)
         pin_frame.pack(padx=8, pady=8, fill='x')
-        self.btn_gen_pin = ctk.CTkButton(pin_frame, text='Generate PIN (allow incoming)', command=self._generate_pin)
-        self.btn_gen_pin.pack(side='left', expand=True, padx=4)
-        self.lbl_pin = ctk.CTkLabel(pin_frame, text='PIN: —')
-        self.lbl_pin.pack(side='left', padx=4)
 
-        # PIN entry for sending
-        pin_frame2 = ctk.CTkFrame(left)
-        pin_frame2.pack(padx=8, pady=4, fill='x')
-        ctk.CTkLabel(pin_frame2, text='Enter PIN from receiver:').pack(side='left', padx=4)
-        self.entry_pin = ctk.CTkEntry(pin_frame2, width=80)
+        self.btn_gen_pin = ctk.CTkButton(pin_frame, text='Generate PIN', command=self._generate_pin)
+        self.btn_gen_pin.pack(side='left', padx=4)
+
+        self.entry_pin = ctk.CTkEntry(pin_frame, placeholder_text='Enter PIN to send')
         self.entry_pin.pack(side='left', padx=4)
+
+        self.lbl_pin_timer = ctk.CTkLabel(pin_frame, text='PIN: —')
+        self.lbl_pin_timer.pack(side='left', padx=4)
 
         # Right panel
         right = ctk.CTkFrame(self, corner_radius=8)
@@ -374,29 +372,27 @@ class App(ctk.CTk):
             messagebox.showwarning('No files', 'Please add files to send.')
             return
 
-        pin = self.entry_pin.get().strip()
-        if not pin:
-            messagebox.showwarning('PIN missing', 'Please enter the PIN from receiver.')
-            return
-
-        self.status.configure(text="Status: Sending...")
-        threading.Thread(target=self._do_send, args=(dev, pin), daemon=True).start()
-
-    def _do_send(self, dev, pin):
+        pin_input = self.entry_pin.get().strip()
         pin_state = self.receiver.get_pin_state()
-        if pin_state:
-            _, salt, _ = pin_state
-        else:
-            self.status.configure(text="Status: Error - PIN expired or invalid")
+
+        if not pin_state:
+            self.status.configure(text="Status: PIN expired or not generated")
             return
 
-        success, err = self.sender.send_files(dev['addr'], dev['tcp_port'], self.files_to_send, pin, salt)
+        real_pin, salt, expiry = pin_state
+        if pin_input != real_pin:
+            self.status.configure(text="Status: Invalid PIN")
+            return
+
+        self.status.configure(text="Status: Sending…")
+        threading.Thread(target=self._do_send_thread, args=(dev, self.files_to_send, pin_input, salt), daemon=True).start()
+
+    def _do_send_thread(self, dev, files, pin, salt):
+        success, err = self.sender.send_files(dev['addr'], dev['tcp_port'], files, pin, salt)
         if success:
-            self.status.configure(text=f"Status: Sent {len(self.files_to_send)} files successfully")
-            self.files_listbox.delete(0, tk.END)
-            self.files_to_send.clear()
+            self.status.configure(text=f"Status: Sent {len(files)} file(s) successfully")
         else:
-            self.status.configure(text=f"Status: Error sending files: {err}")
+            self.status.configure(text=f"Status: Error - {err}")
 
     # ----------------- Polling -----------------
     def _poll_queues(self):
