@@ -339,11 +339,11 @@ class App(ctk.CTk):
 
     def _generate_pin(self):
         pin, salt, expiry = self.receiver.generate_pin()
-        self.lbl_pin.configure(text=f'PIN: {pin} (expires {expiry.strftime("%H:%M:%S UTC")})')
+        self.lbl_pin_timer.configure(text=f'PIN: {pin} (expires {expiry.strftime("%H:%M:%S UTC")})')
         def clear_later():
             time.sleep(PIN_TTL_SECONDS)
             self.receiver.clear_pin()
-            self.lbl_pin.configure(text='PIN: —')
+            self.lbl_pin_timer.configure(text='PIN: —')
         threading.Thread(target=clear_later, daemon=True).start()
 
     def _add_files(self):
