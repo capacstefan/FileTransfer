@@ -1,672 +1,506 @@
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import filedialog, messagebox
 import socket
 import threading
 import time
 import os
-import sys
-import struct
+import json
 import hashlib
-import queue
-from tkinter import Listbox, END
-import customtkinter as ctk
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+import binascii
 
-# ==========================
-# Config simple
-# ==========================
-APP_NAME = "Fishare"
-ADVERTISING_PORT = 50000          # UDP broadcast pentru advertising
-TRANSFER_PORT = 50010             # TCP server pentru transfer
-ADVERTISING_INTERVAL = 1.0        # secunde
-SCAN_CLEANUP_SECONDS = 10         # sterge device-urile inactive
-CHUNK_SIZE = 64 * 1024            # 64KB
-PIN_ROTATE_SECONDS = 180          # 3 minute
-AES_NONCE_SIZE = 12               # AES-GCM standard
-UI_REFRESH_MS = 500               # tick UI
-SALT = b"FishareSaltV1"           # salt fix pentru derivarea cheii din PIN
+# --- CONSTANTE ȘI CONFIGURARE ---
+APP_NAME = "LAN File Transfer"
+BROADCAST_PORT = 12345
+TRANSFER_PORT = 12346
+BROADCAST_INTERVAL = 2  # Secunde între mesaje de advertising
+PIN_UPDATE_INTERVAL = 180  # 3 minute
+CHUNK_SIZE = 64 * 1024  # 64 KB
+SALT = b"salt_pentru_aes"  # Salt fix pentru derivarea cheii
 
-# ==========================
-# Cryptography (AES-GCM)
-# ==========================
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.backends import default_backend
-except ImportError:
-    print("E nevoie de cryptography: pip install cryptography")
-    sys.exit(1)
+# Configurare customtkinter
+ctk.set_appearance_mode("System")  # Modul implicit
+ctk.set_default_color_theme("blue")
 
-def derive_key_from_pin(pin_str: str) -> bytes:
-    """
-    Deriva o cheie AES-256 (32 bytes) din PIN-ul dinamic + SALT, prin PBKDF2-HMAC-SHA256.
-    Iteratii moderate pentru MVP.
-    """
-    pin_bytes = pin_str.encode("utf-8")
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=SALT, iterations=100_000, backend=default_backend())
-    return kdf.derive(pin_bytes)
-
-def aesgcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
-    """
-    AES-GCM: encrypt returns ciphertext + tag concatenat.
-    Protocol: trimitem [len 4B big-endian][cipher_with_tag]
-    """
-    aesgcm = AESGCM(key)
-    return aesgcm.encrypt(nonce, plaintext, aad if aad else None)
-
-def aesgcm_decrypt(key: bytes, nonce: bytes, cipher_with_tag: bytes, aad: bytes = b"") -> bytes:
-    aesgcm = AESGCM(key)
-    return aesgcm.decrypt(nonce, cipher_with_tag, aad if aad else None)
-
-# ==========================
-# PIN dinamic (seed + timp)
-# ==========================
-"""
-Elimina “secret” global. Utilizatorul introduce un PIN seed (de ex. 6-8 cifre).
-PIN-ul dinamic afisat/folosit se calculeaza determinist la fiecare fereastra de 3 minute:
-
-dynamic_pin = SHA256(seed + ":" + window_index) % 1_000_000 (6 cifre)
-
-Astfel, ambele device-uri care au același seed și timp rezonabil sincronizat
-vor avea același PIN dinamic în fereastra curentă. Cheia AES se derivă din PIN-ul dinamic + SALT.
-"""
-
-def current_window_index() -> int:
-    return int(time.time() // PIN_ROTATE_SECONDS)
-
-def dynamic_pin(seed: str) -> str:
-    win_idx = current_window_index()
-    data = f"{seed}:{win_idx}".encode("utf-8")
-    digest = hashlib.sha256(data).digest()
-    pin6 = int.from_bytes(digest[:4], "big") % 1_000_000
-    return f"{pin6:06d}"
-
-def seconds_until_next_window() -> int:
-    now = int(time.time())
-    return PIN_ROTATE_SECONDS - (now % PIN_ROTATE_SECONDS)
-
-# ==========================
-# Protocol
-# ==========================
-"""
-TCP Protocol:
-
-Handshake:
-Client -> Server:
-  [magic "FSHR" 4B][proto_ver 1B=1][session_nonce 12B][pin_window_index 8B]
-Server -> Client:
-  [magic "FSOK" 4B]
-
-Pentru fiecare fișier:
-Header (AES-GCM, AAD="FILEHDR", nonce=make_nonce):
-  Plaintext:
-    [name_len 2B][name ...][file_size 8B]
-Trimitem: [len 4B][cipher_with_tag]
-
-Chunk-uri (AES-GCM, AAD="FILECHK"):
-  Plaintext:
-    [offset 8B][data]
-Trimitem: [len 4B][cipher_with_tag]
-
-Final (AES-GCM, AAD="FILEEND"):
-  Plaintext:
-    [file_size 8B]
-Trimitem: [len 4B][cipher_with_tag]
-
-Nonce per pachet: derivat din session_nonce si counter monoton.
-"""
-
-MAGIC_REQ = b"FSHR"
-MAGIC_OK = b"FSOK"
-PROTOCOL_VERSION = 1
-
-def make_nonce(session_nonce: bytes, counter: int) -> bytes:
-    # 12 bytes total: primii 8 = XOR(session_nonce[:8], counter_be), ultimii 4 = session_nonce[8:12]
-    counter_bytes = struct.pack(">Q", counter)
-    p8 = bytes(a ^ b for a, b in zip(session_nonce[:8], counter_bytes))
-    return p8 + session_nonce[8:12]
-
-# ==========================
-# Advertising / Scan
-# ==========================
-def get_local_hostname():
-    try:
-        return socket.gethostname()
-    except:
-        return "unknown"
-
-def get_local_ip_for_broadcast():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
-
-def advertising_loop(stop_event: threading.Event, name: str):
-    ip = get_local_ip_for_broadcast()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    msg_base = f"{APP_NAME}|{name}|{ip}|{TRANSFER_PORT}".encode("utf-8")
-    while not stop_event.is_set():
-        try:
-            sock.sendto(msg_base, ("255.255.255.255", ADVERTISING_PORT))
-        except Exception:
-            pass
-        time.sleep(ADVERTISING_INTERVAL)
-    sock.close()
-
-def scan_loop(stop_event: threading.Event, devices: dict, devices_lock: threading.Lock, events_q: queue.Queue):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("", ADVERTISING_PORT))
-    except Exception:
-        for p in range(ADVERTISING_PORT, ADVERTISING_PORT + 10):
-            try:
-                sock.bind(("", p))
-                break
-            except:
-                continue
-    sock.settimeout(0.5)
-    last_cleanup = time.time()
-    while not stop_event.is_set():
-        try:
-            data, addr = sock.recvfrom(1024)
-            text = data.decode("utf-8", errors="ignore")
-            parts = text.split("|")
-            if len(parts) == 4 and parts[0] == APP_NAME:
-                name = parts[1]
-                ip = parts[2]
-                port = int(parts[3])
-                with devices_lock:
-                    devices[(ip, port)] = {"name": name, "last": time.time()}
-                events_q.put(("devices_updated", None))
-        except socket.timeout:
-            pass
-        except Exception:
-            pass
-
-        # cleanup
-        if time.time() - last_cleanup > 2:
-            with devices_lock:
-                now = time.time()
-                to_del = [k for k, v in devices.items() if now - v["last"] > SCAN_CLEANUP_SECONDS]
-                for k in to_del:
-                    del devices[k]
-            last_cleanup = time.time()
-    sock.close()
-
-# ==========================
-# TCP server (primire)
-# ==========================
-def ensure_received_dir():
-    try:
-        os.makedirs("received", exist_ok=True)
-    except Exception:
-        pass
-
-def tcp_server_loop(stop_event: threading.Event, pin_seed_getter, events_q: queue.Queue):
-    ensure_received_dir()
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("", TRANSFER_PORT))
-    srv.listen(5)
-    srv.settimeout(0.5)
-
-    def handle_client(conn, addr):
-        try:
-            hdr = conn.recv(4 + 1 + AES_NONCE_SIZE + 8)
-            if len(hdr) < (4 + 1 + AES_NONCE_SIZE + 8):
-                conn.close()
-                return
-            magic = hdr[:4]
-            ver = hdr[4]
-            session_nonce = hdr[5:5+AES_NONCE_SIZE]
-            pin_window_index = struct.unpack(">Q", hdr[5+AES_NONCE_SIZE:5+AES_NONCE_SIZE+8])[0]
-            if magic != MAGIC_REQ or ver != PROTOCOL_VERSION:
-                conn.close()
-                return
-
-            # Derivam PIN dinamic din seed-ul local (acelasi pe ambele, ideal)
-            seed = pin_seed_getter()
-            pin_val = dynamic_pin(seed)
-            key = derive_key_from_pin(pin_val)
-
-            conn.sendall(MAGIC_OK)
-
-            counter = 1
-            while True:
-                # Header fisier: [len 4B][cipher_with_tag]
-                raw = recvall(conn, 4)
-                if not raw:
-                    break
-                clen = struct.unpack(">I", raw)[0]
-                cipher = recvall(conn, clen)
-                if cipher is None or len(cipher) < clen:
-                    break
-
-                nonce = make_nonce(session_nonce, counter)
-                counter += 1
-                try:
-                    pt = aesgcm_decrypt(key, nonce, cipher, b"FILEHDR")
-                except Exception:
-                    break
-
-                # parse header
-                if len(pt) < 2 + 8:
-                    break
-                name_len = struct.unpack(">H", pt[:2])[0]
-                if len(pt) < 2 + name_len + 8:
-                    break
-                name = pt[2:2+name_len].decode("utf-8", errors="ignore")
-                file_size = struct.unpack(">Q", pt[2+name_len:2+name_len+8])[0]
-
-                safe_name = os.path.basename(name)
-                out_path = os.path.join("received", safe_name)
-                f = open(out_path, "wb")
-                received = 0
-                events_q.put(("receive_started", {"name": safe_name, "size": file_size}))
-
-                # chunks
-                while received < file_size:
-                    raw = recvall(conn, 4)
-                    if not raw:
-                        break
-                    clen = struct.unpack(">I", raw)[0]
-                    cipher = recvall(conn, clen)
-                    if cipher is None or len(cipher) < clen:
-                        break
-                    nonce = make_nonce(session_nonce, counter)
-                    counter += 1
-                    try:
-                        pt = aesgcm_decrypt(key, nonce, cipher, b"FILECHK")
-                    except Exception:
-                        break
-                    if len(pt) < 8:
-                        break
-                    offset = struct.unpack(">Q", pt[:8])[0]
-                    data = pt[8:]
-                    if offset != received:
-                        f.close()
-                        try:
-                            os.remove(out_path)
-                        except:
-                            pass
-                        break
-                    f.write(data)
-                    received += len(data)
-                    events_q.put(("receive_progress", {"name": safe_name, "received": received, "size": file_size}))
-
-                # final
-                raw = recvall(conn, 4)
-                if not raw:
-                    f.close()
-                    continue
-                clen = struct.unpack(">I", raw)[0]
-                cipher = recvall(conn, clen)
-                if cipher is None or len(cipher) < clen:
-                    f.close()
-                    continue
-                nonce = make_nonce(session_nonce, counter)
-                counter += 1
-                try:
-                    pt = aesgcm_decrypt(key, nonce, cipher, b"FILEEND")
-                except Exception:
-                    f.close()
-                    continue
-                if len(pt) < 8:
-                    f.close()
-                    continue
-                end_size = struct.unpack(">Q", pt[:8])[0]
-                f.flush()
-                f.close()
-                if end_size != received:
-                    try:
-                        os.remove(out_path)
-                    except:
-                        pass
-                    events_q.put(("receive_failed", {"name": safe_name}))
-                else:
-                    events_q.put(("receive_done", {"name": safe_name, "size": received}))
-        except Exception:
-            pass
-        finally:
-            try:
-                conn.close()
-            except:
-                pass
-
-    while not stop_event.is_set():
-        try:
-            conn, addr = srv.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            t.start()
-        except socket.timeout:
-            pass
-        except Exception:
-            pass
-    srv.close()
-
-def recvall(conn, n) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = conn.recv(n - len(buf))
-        if not chunk:
-            return None if len(buf) == 0 else buf
-        buf += chunk
-    return buf
-
-# ==========================
-# Client TCP (trimitere)
-# ==========================
-def send_files(host: str, port: int, files: list, pin_seed_getter, events_q: queue.Queue):
-    paths = [p for p in files if os.path.isfile(p)]
-    if not paths:
-        return
-
-    session_nonce = os.urandom(AES_NONCE_SIZE)
-    seed = pin_seed_getter()
-    pin_val = dynamic_pin(seed)
-    key = derive_key_from_pin(pin_val)
-    pin_window_index = current_window_index()
-
-    try:
-        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        conn.settimeout(5)
-        conn.connect((host, port))
-        conn.sendall(MAGIC_REQ + bytes([PROTOCOL_VERSION]) + session_nonce + struct.pack(">Q", pin_window_index))
-        ok = recvall(conn, 4)
-        if ok != MAGIC_OK:
-            conn.close()
-            return
-        counter = 1
-
-        for path in paths:
-            name = os.path.basename(path)
-            size = os.path.getsize(path)
-            events_q.put(("send_started", {"name": name, "size": size, "dest": f"{host}:{port}"}))
-            name_bytes = name.encode("utf-8")
-            hdr_pt = struct.pack(">H", len(name_bytes)) + name_bytes + struct.pack(">Q", size)
-            nonce = make_nonce(session_nonce, counter)
-            counter += 1
-            cipher = aesgcm_encrypt(key, nonce, hdr_pt, b"FILEHDR")
-            conn.sendall(struct.pack(">I", len(cipher)) + cipher)
-
-            sent = 0
-            with open(path, "rb") as f:
-                while sent < size:
-                    data = f.read(CHUNK_SIZE)
-                    if not data:
-                        break
-                    pt = struct.pack(">Q", sent) + data
-                    nonce = make_nonce(session_nonce, counter)
-                    counter += 1
-                    cipher = aesgcm_encrypt(key, nonce, pt, b"FILECHK")
-                    conn.sendall(struct.pack(">I", len(cipher)) + cipher)
-                    sent += len(data)
-                    events_q.put(("send_progress", {"name": name, "sent": sent, "size": size, "dest": f"{host}:{port}"}))
-
-            pt = struct.pack(">Q", size)
-            nonce = make_nonce(session_nonce, counter)
-            counter += 1
-            cipher = aesgcm_encrypt(key, nonce, pt, b"FILEEND")
-            conn.sendall(struct.pack(">I", len(cipher)) + cipher)
-            events_q.put(("send_done", {"name": name, "size": size, "dest": f"{host}:{port}"}))
-
-        conn.close()
-    except Exception:
-        try:
-            conn.close()
-        except:
-            pass
-        events_q.put(("send_failed", {"dest": f"{host}:{port}"}))
-
-# ==========================
-# UI (CustomTkinter) – mărită și clară
-# ==========================
-class FishareApp(ctk.CTk):
+class FileTransferApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
-        self.title("Fishare - LAN File Transfer")
-        self.geometry("1024x700")
-        self.resizable(True, True)
+        self.title(APP_NAME)
+        self.geometry("800x600")
+        
+        # Variabile de stare
+        self.local_ip = self.get_local_ip()
+        self.devices = {}  # {IP: Nume_Host}
+        self.files_to_send = []  # [(cale_fisier, nume_fisier, dimensiune)]
+        self.current_pin = self.generate_pin()
 
-        # State
-        self.stop_event = threading.Event()
-        self.events_q = queue.Queue()
-        self.devices = {}
-        self.devices_lock = threading.Lock()
-        self.files = []
-        self.pin_seed = "123456"  # utilizatorul poate schimba
-        self.last_window_idx = current_window_index()
-
-        # Titlu
-        self.top_label = ctk.CTkLabel(self, text="FISHARE", font=("Segoe UI", 34, "bold"))
-        self.top_label.pack(pady=(16, 10))
-
-        # PIN seed + pin dinamic + countdown
-        pin_frame = ctk.CTkFrame(self)
-        pin_frame.pack(fill="x", padx=16, pady=(0, 12))
-
-        self.pin_seed_entry = ctk.CTkEntry(pin_frame, placeholder_text="PIN seed (ex. 6-8 cifre)", width=260, font=("Segoe UI", 18))
-        self.pin_seed_entry.insert(0, self.pin_seed)
-        self.pin_seed_entry.pack(side="left", padx=10, pady=10)
-
-        self.pin_set_btn = ctk.CTkButton(pin_frame, text="Set PIN seed", font=("Segoe UI", 18, "bold"), command=self.on_set_pin_seed)
-        self.pin_set_btn.pack(side="left", padx=10)
-
-        self.pin_dynamic_label = ctk.CTkLabel(pin_frame, text=self.pin_dynamic_text(), font=("Segoe UI", 22, "bold"))
-        self.pin_dynamic_label.pack(side="left", padx=20)
-
-        self.pin_timer_label = ctk.CTkLabel(pin_frame, text=self.pin_timer_text(), font=("Segoe UI", 18))
-        self.pin_timer_label.pack(side="left", padx=12)
-
-        # Zone principale
-        mid_frame = ctk.CTkFrame(self)
-        mid_frame.pack(fill="both", expand=True, padx=16, pady=10)
-
-        left_frame = ctk.CTkFrame(mid_frame)
-        left_frame.pack(side="left", fill="both", expand=True, padx=(10, 6), pady=10)
-
-        right_frame = ctk.CTkFrame(mid_frame)
-        right_frame.pack(side="left", fill="both", expand=True, padx=(6, 10), pady=10)
-
-        # Devices
-        dev_title = ctk.CTkLabel(left_frame, text="Device-uri disponibile", font=("Segoe UI", 24, "bold"))
-        dev_title.pack(pady=(10, 6))
-        self.devices_list = Listbox(left_frame, height=16, font=("Segoe UI", 16), activestyle="none")
-        self.devices_list.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-        self.refresh_btn = ctk.CTkButton(left_frame, text="Refresh lista", font=("Segoe UI", 18, "bold"), command=self.refresh_devices_list)
-        self.refresh_btn.pack(pady=(0, 10))
-
-        # Files
-        files_title = ctk.CTkLabel(right_frame, text="Fișiere de trimis", font=("Segoe UI", 24, "bold"))
-        files_title.pack(pady=(10, 6))
-        self.files_list = Listbox(right_frame, height=16, font=("Segoe UI", 16), activestyle="none")
-        self.files_list.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-
-        files_btn_frame = ctk.CTkFrame(right_frame)
-        files_btn_frame.pack(fill="x", padx=10, pady=(0, 10))
-        self.add_file_btn = ctk.CTkButton(files_btn_frame, text="Adaugă fișiere", font=("Segoe UI", 18, "bold"), command=self.on_add_file)
-        self.add_file_btn.pack(side="left", padx=6)
-        self.clear_files_btn = ctk.CTkButton(files_btn_frame, text="Curăță lista", font=("Segoe UI", 18, "bold"), command=self.on_clear_files)
-        self.clear_files_btn.pack(side="left", padx=6)
-
-        # Send
-        send_frame = ctk.CTkFrame(self)
-        send_frame.pack(fill="x", padx=16, pady=8)
-        self.send_btn = ctk.CTkButton(send_frame, text="Trimite către device selectat", font=("Segoe UI", 20, "bold"), command=self.on_send)
-        self.send_btn.pack(pady=10)
-
-        # Progress jos
-        bottom_frame = ctk.CTkFrame(self, fg_color="#002600")
-        bottom_frame.pack(fill="x", padx=0, pady=(6, 0))
-        self.progress_label = ctk.CTkLabel(bottom_frame, text="Progres transfer", font=("Segoe UI", 22, "bold"))
-        self.progress_label.pack(pady=(8, 4))
-        self.progress = ctk.CTkProgressBar(bottom_frame, height=20, progress_color="green")
-        self.progress.pack(fill="x", padx=16, pady=(0, 12))
-        self.progress.set(0.0)
-
-        # Status
-        self.status_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 18))
-        self.status_label.pack(pady=(6, 10))
-
-        # Threads
-        self.name = get_local_hostname()
-        self.stop_event.clear()
-        self.advertising_thread = threading.Thread(target=advertising_loop, args=(self.stop_event, self.name), daemon=True)
-        self.scan_thread = threading.Thread(target=scan_loop, args=(self.stop_event, self.devices, self.devices_lock, self.events_q), daemon=True)
-        self.server_thread = threading.Thread(target=tcp_server_loop, args=(self.stop_event, self.get_pin_seed, self.events_q), daemon=True)
-
-        self.advertising_thread.start()
-        self.scan_thread.start()
-        self.server_thread.start()
-
-        # UI ticks
-        self.after(UI_REFRESH_MS, self.ui_tick)
-        self.after(500, self.update_pin_display)
-
-        # Close
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    # ----- PIN seed / afisari -----
-    def get_pin_seed(self) -> str:
-        return self.pin_seed
-
-    def on_set_pin_seed(self):
-        val = self.pin_seed_entry.get().strip()
-        if not val:
-            self.status("Introdu un PIN seed.")
-            return
-        self.pin_seed = val
-        self.status("PIN seed setat. Folosește același seed pe ambele device-uri.")
-        self.update_pin_display()
-
-    def pin_dynamic_text(self) -> str:
-        return f"PIN: {dynamic_pin(self.pin_seed)}"
-
-    def pin_timer_text(self) -> str:
-        secs = seconds_until_next_window()
-        mm = secs // 60
-        ss = secs % 60
-        return f"Se schimbă în {mm:02d}:{ss:02d}"
-
-    def update_pin_display(self):
-        self.pin_dynamic_label.configure(text=self.pin_dynamic_text())
-        self.pin_timer_label.configure(text=self.pin_timer_text())
-        self.after(500, self.update_pin_display)  # live, din 0.5s
-
-    # ----- Files -----
-    def on_add_file(self):
+        # Thread-uri și Sockets
+        self.broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.broadcast_socket.bind(('', BROADCAST_PORT))
+        
+        self.transfer_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.transfer_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Neapărat să încercăm să bind-uim socketul de transfer
         try:
-            from tkinter import filedialog
-            paths = filedialog.askopenfilenames(title="Selectează fișiere")
-            if paths:
-                for p in paths:
-                    if os.path.isfile(p):
-                        self.files.append(p)
-                        self.files_list.insert(END, os.path.basename(p))
-                self.status(f"Adăugate {len(paths)} fișiere.")
-        except Exception:
-            self.status("Nu s-a putut deschide dialogul de fișiere.")
-
-    def on_clear_files(self):
-        self.files.clear()
-        self.files_list.delete(0, END)
-        self.status("Lista de fișiere a fost curățată.")
-
-    # ----- Devices -----
-    def refresh_devices_list(self):
-        with self.devices_lock:
-            items = [f"{v['name']} | {ip}:{port}" for (ip, port), v in self.devices.items()]
-        self.devices_list.delete(0, END)
-        for it in items:
-            self.devices_list.insert(END, it)
-
-    # ----- Send -----
-    def on_send(self):
-        sel = self.devices_list.curselection()
-        if not sel:
-            self.status("Selectează un device din listă.")
+            self.transfer_server_socket.bind(('', TRANSFER_PORT))
+        except OSError as e:
+            messagebox.showerror("Eroare Critică", f"Nu se poate lega la portul de transfer {TRANSFER_PORT}. Verificați dacă altă aplicație folosește acest port. Eroare: {e}")
+            self.quit()
             return
-        item = self.devices_list.get(sel[0])
+
+        # Pornirea thread-urilor
+        self.is_running = True
+        threading.Thread(target=self.broadcast_advertisement, daemon=True).start()
+        threading.Thread(target=self.listen_for_devices, daemon=True).start()
+        threading.Thread(target=self.start_transfer_server, daemon=True).start()
+        threading.Thread(target=self.pin_updater, daemon=True).start()
+        
+        # UI Setup
+        self.setup_ui()
+
+    # --- Utilități de Rețea și PIN ---
+    def get_local_ip(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            right = item.split("|")[1].strip()
-            host, port_s = right.split(":")
-            port = int(port_s)
+            # Nu contează adresa la care ne conectăm, vrem doar să aflăm IP-ul local
+            s.connect(('10.255.255.255', 1))
+            IP = s.getsockname()[0]
         except Exception:
-            self.status("Intrare device invalidă.")
-            return
-        if not self.files:
-            self.status("Lista de fișiere e goală.")
-            return
-        t = threading.Thread(target=send_files, args=(host, port, self.files.copy(), self.get_pin_seed, self.events_q), daemon=True)
-        t.start()
-        self.status(f"Pornit transfer către {host}:{port}.")
+            IP = '127.0.0.1'
+        finally:
+            s.close()
+        return IP
 
-    # ----- Events & tick -----
-    def status(self, msg: str):
-        self.status_label.configure(text=msg)
+    def generate_pin(self):
+        # Generează un PIN simplu din 6 cifre
+        return str(binascii.hexlify(os.urandom(3)).decode())[:6].upper()
 
-    def ui_tick(self):
-        self.refresh_devices_list()
-        while True:
+    def pin_updater(self):
+        while self.is_running:
+            time.sleep(PIN_UPDATE_INTERVAL)
+            if self.is_running:
+                self.current_pin = self.generate_pin()
+                self.update_pin_label()
+
+    def update_pin_label(self):
+        self.pin_label.configure(text=f"PIN (Se schimbă la 3 min): {self.current_pin}")
+        self.pin_label.update()
+    
+    def derive_key(self, pin: str) -> bytes:
+        """Derivă cheia AES pe 256 de biți din PIN și SALT."""
+        data = (pin + SALT.decode()).encode('utf-8')
+        key = hashlib.sha256(data).digest()
+        return key
+        
+    # --- Interfață Grafică (UI) ---
+    def setup_ui(self):
+        # Configurarea grid-ului principal
+        self.grid_columnconfigure((0, 1), weight=1)
+        self.grid_rowconfigure((0, 1, 2), weight=1)
+
+        # Frame-ul de Informații Locale (Partea de Sus)
+        local_info_frame = ctk.CTkFrame(self)
+        local_info_frame.grid(row=0, column=0, columnspan=2, padx=20, pady=(20, 10), sticky="nsew")
+        local_info_frame.grid_columnconfigure((0, 1), weight=1)
+        
+        ctk.CTkLabel(local_info_frame, text="Informații Locale", font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, columnspan=2, pady=(10, 5))
+        ctk.CTkLabel(local_info_frame, text=f"IP Local: {self.local_ip}", font=ctk.CTkFont(size=14, weight="bold")).grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        
+        self.pin_label = ctk.CTkLabel(local_info_frame, text=f"PIN (Se schimbă la 3 min): {self.current_pin}", text_color="green", font=ctk.CTkFont(size=14, weight="bold"))
+        self.pin_label.grid(row=1, column=1, padx=10, pady=5, sticky="e")
+
+        # Frame-ul de Dispozitive (Stânga)
+        device_frame = ctk.CTkFrame(self)
+        device_frame.grid(row=1, column=0, padx=(20, 10), pady=10, sticky="nsew")
+        device_frame.grid_rowconfigure(1, weight=1)
+        device_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(device_frame, text="Dispozitive Detectate 📡", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=10, pady=(10, 5))
+        
+        # Folosim tk.Listbox deoarece CTk nu are (sau o simulare ar fi prea complexă)
+        self.device_listbox_frame = tk.Frame(device_frame, bg=device_frame.cget("fg_color")[1]) # Fundalul frame-ului pentru Listbox
+        self.device_listbox_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        
+        self.device_listbox = tk.Listbox(self.device_listbox_frame, selectmode=tk.SINGLE, font=('Arial', 12), borderwidth=0, highlightthickness=0)
+        self.device_listbox.pack(fill="both", expand=True)
+
+        ctk.CTkButton(device_frame, text="Trimite Fisiere", command=self.send_files_dialog, font=ctk.CTkFont(size=14, weight="bold"), height=40).grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
+
+        # Frame-ul de Fisiere (Dreapta)
+        file_frame = ctk.CTkFrame(self)
+        file_frame.grid(row=1, column=1, padx=(10, 20), pady=10, sticky="nsew")
+        file_frame.grid_rowconfigure(1, weight=1)
+        file_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(file_frame, text="Fisiere pentru Transfer 📁", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=10, pady=(10, 5))
+        
+        self.file_listbox_frame = tk.Frame(file_frame, bg=file_frame.cget("fg_color")[1])
+        self.file_listbox_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        
+        self.file_listbox = tk.Listbox(self.file_listbox_frame, selectmode=tk.MULTIPLE, font=('Arial', 12), borderwidth=0, highlightthickness=0)
+        self.file_listbox.pack(fill="both", expand=True)
+        
+        # Frame de butoane pentru fișiere
+        file_button_frame = ctk.CTkFrame(file_frame, fg_color="transparent")
+        file_button_frame.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
+        file_button_frame.grid_columnconfigure((0, 1), weight=1)
+        
+        ctk.CTkButton(file_button_frame, text="Adaugă Fisiere", command=self.add_files, font=ctk.CTkFont(size=14), height=40).grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        ctk.CTkButton(file_button_frame, text="Șterge Selectate", command=self.remove_selected_files, font=ctk.CTkFont(size=14), height=40).grid(row=0, column=1, padx=(5, 0), sticky="ew")
+        
+        # Progress Bar (Partea de Jos)
+        self.progress_bar = ctk.CTkProgressBar(self, orientation="horizontal", mode="determinate", height=20, fg_color="gray", progress_color="green")
+        self.progress_bar.grid(row=2, column=0, columnspan=2, padx=20, pady=(10, 20), sticky="ew")
+        self.progress_bar.set(0)
+        
+        self.progress_label = ctk.CTkLabel(self, text="Gata de transfer.", font=ctk.CTkFont(size=12))
+        self.progress_label.grid(row=3, column=0, columnspan=2, padx=20, pady=(0, 10), sticky="ew")
+        
+        self.update_device_listbox() # Initializare
+
+    # --- Funcții de Interfață ---
+    def add_files(self):
+        file_paths = filedialog.askopenfilenames()
+        if file_paths:
+            for path in file_paths:
+                file_name = os.path.basename(path)
+                file_size = os.path.getsize(path)
+                self.files_to_send.append((path, file_name, file_size))
+                self.file_listbox.insert(tk.END, f"{file_name} ({self.format_size(file_size)})")
+
+    def remove_selected_files(self):
+        selected_indices = self.file_listbox.curselection()
+        # Ștergem de la coadă la cap pentru a nu afecta indexarea
+        for index in reversed(selected_indices):
+            self.file_listbox.delete(index)
+            del self.files_to_send[index]
+
+    def format_size(self, size_bytes):
+        """Formatează dimensiunea fișierului într-un format lizibil (KB, MB, GB)."""
+        if size_bytes >= 1024**3:
+            return f"{size_bytes / 1024**3:.2f} GB"
+        elif size_bytes >= 1024**2:
+            return f"{size_bytes / 1024**2:.2f} MB"
+        elif size_bytes >= 1024:
+            return f"{size_bytes / 1024:.2f} KB"
+        else:
+            return f"{size_bytes} Bytes"
+
+    def update_device_listbox(self):
+        """Actualizează Listbox-ul cu dispozitivele detectate în timp real."""
+        selected_index = None
+        try:
+            selected_index = self.device_listbox.curselection()[0]
+        except IndexError:
+            pass # Nu e selectat nimic
+            
+        self.device_listbox.delete(0, tk.END)
+        for ip, hostname in self.devices.items():
+            if ip != self.local_ip: # Nu ne afișăm pe noi înșine
+                self.device_listbox.insert(tk.END, f"{hostname} ({ip})")
+
+        # Reselectăm elementul dacă a fost selectat înainte
+        if selected_index is not None and selected_index < self.device_listbox.size():
+            self.device_listbox.selection_set(selected_index)
+            
+        # Programăm următoarea actualizare
+        self.after(1000, self.update_device_listbox) 
+
+    # --- Dialog de Trimitere (Solicitare PIN) ---
+    def send_files_dialog(self):
+        if not self.files_to_send:
+            messagebox.showwarning("Atenție", "Vă rugăm să adăugați fișiere de trimis.")
+            return
+
+        try:
+            selected_index = self.device_listbox.curselection()[0]
+        except IndexError:
+            messagebox.showwarning("Atenție", "Vă rugăm să selectați un dispozitiv din listă.")
+            return
+
+        # Obținem IP-ul dispozitivului selectat
+        selected_device_text = self.device_listbox.get(selected_index)
+        target_ip = selected_device_text.split('(')[-1].strip(')')
+        
+        # Crearea ferestrei de dialog pentru PIN (Toplevel)
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Introducere PIN")
+        dialog.geometry("300x150")
+        dialog.transient(self) # Fereastra rămâne deasupra
+        dialog.grab_set() # Blochează interacțiunea cu fereastra principală
+
+        ctk.CTkLabel(dialog, text=f"PIN-ul de pe {target_ip}", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=10)
+        pin_entry = ctk.CTkEntry(dialog, show="*", width=200, font=ctk.CTkFont(size=14))
+        pin_entry.pack(pady=5)
+
+        def start_transfer_callback():
+            pin = pin_entry.get()
+            if not pin:
+                messagebox.showerror("Eroare PIN", "Vă rugăm să introduceți PIN-ul.")
+                return
+            
+            dialog.destroy()
+            threading.Thread(target=self.initiate_transfer, args=(target_ip, pin), daemon=True).start()
+        
+        ctk.CTkButton(dialog, text="Start Transfer", command=start_transfer_callback, font=ctk.CTkFont(size=14)).pack(pady=10)
+        
+    # --- Protocol de Rețea (Advertising și Descoperire) ---
+    def broadcast_advertisement(self):
+        hostname = socket.gethostname()
+        message = json.dumps({"ip": self.local_ip, "hostname": hostname}).encode('utf-8')
+        while self.is_running:
             try:
-                ev, data = self.events_q.get_nowait()
-            except queue.Empty:
-                break
-            if ev == "devices_updated":
-                self.refresh_devices_list()
-            elif ev == "send_started":
-                name = data["name"]; size = data["size"]; dest = data["dest"]
-                self.status(f"Trimit {name} ({size} bytes) către {dest}...")
-                self.progress.set(0.0)
-            elif ev == "send_progress":
-                name = data["name"]; sent = data["sent"]; size = data["size"]
-                pct = sent / size if size else 0
-                self.progress.set(pct)
-                self.status(f"{name}: {sent}/{size} bytes")
-            elif ev == "send_done":
-                name = data["name"]; size = data["size"]; dest = data["dest"]
-                self.progress.set(1.0)
-                self.status(f"Trimis {name} ({size} bytes) către {dest}.")
-            elif ev == "send_failed":
-                dest = data["dest"]
-                self.status(f"Transfer către {dest} a eșuat.")
-                self.progress.set(0.0)
-            elif ev == "receive_started":
-                name = data["name"]; size = data["size"]
-                self.status(f"Primire {name} ({size} bytes)...")
-                self.progress.set(0.0)
-            elif ev == "receive_progress":
-                name = data["name"]; rec = data["received"]; size = data["size"]
-                pct = rec / size if size else 0
-                self.progress.set(pct)
-                self.status(f"{name}: {rec}/{size} bytes")
-            elif ev == "receive_done":
-                name = data["name"]; size = data["size"]
-                self.progress.set(1.0)
-                self.status(f"Primit {name} ({size} bytes). Saved în ./received")
-            elif ev == "receive_failed":
-                name = data["name"]
-                self.progress.set(0.0)
-                self.status(f"Primirea pentru {name} a eșuat.")
-        self.after(UI_REFRESH_MS, self.ui_tick)
+                # Trimite la adresa de broadcast
+                self.broadcast_socket.sendto(message, ('<broadcast>', BROADCAST_PORT))
+            except Exception as e:
+                # print(f"Eroare la broadcasting: {e}") # Debugging
+                pass
+            time.sleep(BROADCAST_INTERVAL)
 
-    def on_close(self):
+    def listen_for_devices(self):
+        while self.is_running:
+            try:
+                data, addr = self.broadcast_socket.recvfrom(1024)
+                message = json.loads(data.decode('utf-8'))
+                
+                device_ip = message.get("ip")
+                device_hostname = message.get("hostname")
+
+                if device_ip and device_ip != self.local_ip:
+                    # Adaugă sau actualizează dispozitivul
+                    self.devices[device_ip] = device_hostname
+                    # Păstrează doar dispozitivele recent văzute (opțional: curățare pe bază de timestamp)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                # print(f"Eroare la primirea broadcast: {e}") # Debugging
+                continue
+
+    # --- Protocol de Transfer (Sender Side) ---
+    def initiate_transfer(self, target_ip, pin):
+        """Inițiază conexiunea și trimiterea fișierelor către receiver."""
+        self.progress_label.configure(text=f"Conectare la {target_ip}...")
+        self.progress_bar.set(0)
+        
         try:
-            self.stop_event.set()
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.connect((target_ip, TRANSFER_PORT))
+            
+            # 1. Trimiterea PIN-ului pentru verificare
+            client_socket.sendall(pin.encode('utf-8'))
+            
+            # 2. Primirea răspunsului de la server
+            response = client_socket.recv(1024).decode('utf-8')
+            
+            if response == "PIN_OK":
+                key = self.derive_key(pin)
+                
+                # Pregătirea metadatelor tuturor fișierelor
+                metadata = []
+                total_size = 0
+                for path, name, size in self.files_to_send:
+                    metadata.append({"name": name, "size": size})
+                    total_size += size
+                
+                # 3. Trimiterea metadatelor (număr de fișiere, nume, dimensiuni)
+                metadata_json = json.dumps(metadata).encode('utf-8')
+                metadata_header = len(metadata_json).to_bytes(4, byteorder='big') # Lungimea metadatelor
+                
+                client_socket.sendall(metadata_header)
+                client_socket.sendall(metadata_json)
+                
+                # 4. Începe transferul fișierelor
+                self.progress_label.configure(text=f"Începe transferul de {len(self.files_to_send)} fișiere...")
+                
+                for path, name, size in self.files_to_send:
+                    self.send_file(client_socket, path, name, size, key, total_size)
+                    
+                self.progress_label.configure(text="✅ Transfer complet. Gata de transfer.")
+                self.progress_bar.set(1)
+                
+            else:
+                self.progress_label.configure(text="❌ Transfer eșuat. PIN incorect sau eroare server.")
+                messagebox.showerror("Eroare", "PIN-ul introdus este incorect. Transfer anulat.")
+                
+            client_socket.close()
+
+        except ConnectionRefusedError:
+            self.progress_label.configure(text="❌ Transfer eșuat. Conexiune refuzată.")
+            messagebox.showerror("Eroare", f"Conexiune refuzată la {target_ip}. Aplicația nu rulează sau firewall-ul blochează.")
+        except Exception as e:
+            self.progress_label.configure(text=f"❌ Transfer eșuat. Eroare: {e}")
+            messagebox.showerror("Eroare", f"Eroare neașteptată la trimitere: {e}")
+            
+        self.progress_bar.set(0) # Resetare la final
+
+    def send_file(self, sock, file_path, file_name, file_size, key, total_transfer_size):
+        """Trimite un singur fișier, împărțit în chunk-uri criptate."""
+        self.progress_label.configure(text=f"Transfer: {file_name}...")
+        
+        cipher = AES.new(key, AES.MODE_CBC)
+        iv = cipher.iv # Vectorul de inițializare
+        
+        # 1. Trimiterea IV-ului (16 bytes)
+        sock.sendall(iv) 
+        
+        bytes_sent = 0
+        
+        with open(file_path, 'rb') as f:
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                
+                # Criptare: padding + criptare
+                padded_chunk = pad(chunk, AES.block_size)
+                encrypted_chunk = cipher.encrypt(padded_chunk)
+                
+                # Trimite lungimea chunk-ului criptat (4 bytes) + chunk-ul în sine
+                chunk_len_header = len(encrypted_chunk).to_bytes(4, byteorder='big')
+                sock.sendall(chunk_len_header)
+                sock.sendall(encrypted_chunk)
+                
+                bytes_sent += len(chunk)
+                
+                # Actualizare ProgressBar (folosind doar dimensiunea fișierului curent, pentru simplitate vizuală)
+                # O implementare mai robustă ar trebui să țină cont de progresul total
+                progress = bytes_sent / file_size
+                self.progress_bar.set(progress)
+                self.progress_label.configure(text=f"Transfer: {file_name} - {self.format_size(bytes_sent)}/{self.format_size(file_size)}")
+
+            # Semnal de sfârșit de fișier (header de lungime zero)
+            sock.sendall((0).to_bytes(4, byteorder='big'))
+
+    # --- Protocol de Transfer (Receiver Side) ---
+    def start_transfer_server(self):
+        """Ascultă pe portul de transfer pentru conexiuni noi."""
+        self.transfer_server_socket.listen(5)
+        while self.is_running:
+            try:
+                conn, addr = self.transfer_server_socket.accept()
+                threading.Thread(target=self.handle_transfer_request, args=(conn, addr), daemon=True).start()
+            except Exception as e:
+                # print(f"Eroare la acceptarea conexiunii: {e}") # Debugging
+                continue
+
+    def handle_transfer_request(self, conn, addr):
+        """Gestionează o singură cerere de transfer de la un sender."""
+        sender_ip = addr[0]
+        
+        try:
+            # 1. Primirea și verificarea PIN-ului
+            pin = conn.recv(1024).decode('utf-8')
+            
+            if pin != self.current_pin:
+                conn.sendall("PIN_INCORRECT".encode('utf-8'))
+                conn.close()
+                return
+
+            conn.sendall("PIN_OK".encode('utf-8'))
+            key = self.derive_key(pin)
+            
+            # 2. Primirea metadatelor
+            metadata_header = conn.recv(4)
+            if not metadata_header: raise Exception("Eroare la primirea header-ului de metadate.")
+            metadata_len = int.from_bytes(metadata_header, byteorder='big')
+            
+            metadata_json = conn.recv(metadata_len).decode('utf-8')
+            metadata = json.loads(metadata_json)
+            
+            # 3. Pregătire director de salvare
+            save_dir = os.path.join(os.getcwd(), "Received_Files")
+            os.makedirs(save_dir, exist_ok=True)
+            
+            # 4. Primirea fișierelor
+            self.progress_label.configure(text=f"Primește de la {sender_ip}...")
+            
+            for file_info in metadata:
+                self.receive_file(conn, file_info['name'], file_info['size'], save_dir, key)
+            
+            self.progress_label.configure(text="✅ Toate fișierele primite. Gata de transfer.")
+            self.progress_bar.set(1)
+
+        except Exception as e:
+            self.progress_label.configure(text=f"❌ Primire eșuată de la {sender_ip}. Eroare: {e}")
+        finally:
+            conn.close()
+            self.progress_bar.set(0) # Resetare
+
+    def receive_file(self, conn, file_name, file_size, save_dir, key):
+        """Primește un singur fișier criptat, pe chunk-uri."""
+        self.progress_label.configure(text=f"Primește: {file_name}...")
+        save_path = os.path.join(save_dir, file_name)
+        
+        # 1. Primirea IV-ului (16 bytes)
+        iv = conn.recv(16)
+        if len(iv) != 16: raise Exception("Eroare la primirea IV-ului.")
+        cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+        
+        bytes_received = 0
+        
+        with open(save_path, 'wb') as f:
+            while True:
+                # 2. Primirea header-ului de lungime (4 bytes)
+                chunk_len_header = self.recv_all(conn, 4)
+                if not chunk_len_header:
+                    raise Exception("Conexiune închisă neașteptat.")
+                    
+                encrypted_chunk_len = int.from_bytes(chunk_len_header, byteorder='big')
+                
+                if encrypted_chunk_len == 0:
+                    break # Semnal de sfârșit de fișier
+                
+                # 3. Primirea chunk-ului criptat
+                encrypted_chunk = self.recv_all(conn, encrypted_chunk_len)
+                if not encrypted_chunk:
+                    raise Exception("Conexiune închisă neașteptat în timpul primirii chunk-ului.")
+                    
+                # Decriptare
+                decrypted_padded_chunk = cipher.decrypt(encrypted_chunk)
+                decrypted_chunk = unpad(decrypted_padded_chunk, AES.block_size)
+
+                f.write(decrypted_chunk)
+                bytes_received += len(decrypted_chunk)
+                
+                # Actualizare ProgressBar
+                progress = bytes_received / file_size
+                self.progress_bar.set(progress)
+                self.progress_label.configure(text=f"Primește: {file_name} - {self.format_size(bytes_received)}/{self.format_size(file_size)}")
+        
+        # Verificare finală a dimensiunii
+        if bytes_received != file_size:
+            print(f"Atenție: Dimensiunea primită ({bytes_received}) nu corespunde cu dimensiunea așteptată ({file_size}) pentru {file_name}")
+
+    def recv_all(self, sock, n):
+        """Funcție helper pentru a ne asigura că primim exact n bytes."""
+        data = bytearray()
+        while len(data) < n:
+            packet = sock.recv(n - len(data))
+            if not packet:
+                return None
+            data.extend(packet)
+        return data
+
+    # --- Curățare ---
+    def on_closing(self):
+        self.is_running = False
+        try:
+            self.broadcast_socket.close()
+            # O modalitate de a debloca socketul de ascultare (transfer_server_socket)
+            temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            temp_sock.connect(('127.0.0.1', TRANSFER_PORT))
+            temp_sock.close()
+            self.transfer_server_socket.close()
         except:
             pass
-        self.after(200, self.destroy)
+        self.destroy()
 
-# ==========================
-# Main
-# ==========================
 if __name__ == "__main__":
-    app = FishareApp()
+    app = FileTransferApp()
+    # Asigură-te că funcția de curățare este apelată la închiderea ferestrei
+    app.protocol("WM_DELETE_WINDOW", app.on_closing) 
     app.mainloop()
