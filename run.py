@@ -1,10 +1,9 @@
 """
 LAN File Transfer — CustomTkinter
-Updated version with full fixes for Listbox issues (uses tkinter.Listbox).
+Fully functional version with PIN entry, file send/receive, discovery, and feedback
 """
 
 import os
-import sys
 import socket
 import threading
 import json
@@ -12,18 +11,18 @@ import time
 import uuid
 import struct
 import secrets
-import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Queue, Empty
 
 import tkinter as tk
+from tkinter import messagebox, filedialog, simpledialog
+
 try:
     import customtkinter as ctk
 except Exception:
     print("Please install customtkinter: pip install customtkinter")
     raise
-from tkinter import messagebox, filedialog
 
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
@@ -276,12 +275,11 @@ class App(ctk.CTk):
         self.after(200, self._poll_queues)
 
     def _build_ui(self):
+        # Left panel
         left = ctk.CTkFrame(self, width=260, corner_radius=8)
         left.pack(side='left', fill='y', padx=12, pady=12)
 
         ctk.CTkLabel(left, text='Devices on LAN', font=('Helvetica', 14, 'bold')).pack(padx=8, pady=(8,4))
-
-        # Devices Listbox
         self.listbox_frame = ctk.CTkFrame(left)
         self.listbox_frame.pack(padx=8, pady=4, fill='both', expand=True)
         self.listbox_tk = tk.Listbox(self.listbox_frame, height=10, selectmode=tk.SINGLE, font=('Segoe UI', 11))
@@ -292,12 +290,20 @@ class App(ctk.CTk):
         self.lbl_selected = ctk.CTkLabel(left, text='Selected: —', anchor='w')
         self.lbl_selected.pack(fill='x', padx=8, pady=(6,0))
 
+        # PIN display for receiver
         pin_frame = ctk.CTkFrame(left)
         pin_frame.pack(padx=8, pady=8, fill='x')
         self.btn_gen_pin = ctk.CTkButton(pin_frame, text='Generate PIN (allow incoming)', command=self._generate_pin)
         self.btn_gen_pin.pack(side='left', expand=True, padx=4)
         self.lbl_pin = ctk.CTkLabel(pin_frame, text='PIN: —')
         self.lbl_pin.pack(side='left', padx=4)
+
+        # PIN entry for sending
+        pin_frame2 = ctk.CTkFrame(left)
+        pin_frame2.pack(padx=8, pady=4, fill='x')
+        ctk.CTkLabel(pin_frame2, text='Enter PIN from receiver:').pack(side='left', padx=4)
+        self.entry_pin = ctk.CTkEntry(pin_frame2, width=80)
+        self.entry_pin.pack(side='left', padx=4)
 
         # Right panel
         right = ctk.CTkFrame(self, corner_radius=8)
@@ -313,7 +319,6 @@ class App(ctk.CTk):
         self.btn_send = ctk.CTkButton(btn_frame, text='Send', command=self._send_files)
         self.btn_send.pack(side='right', padx=6)
 
-        # Files listbox
         self.files_frame = ctk.CTkFrame(right)
         self.files_frame.pack(padx=8, pady=4, fill='both', expand=True)
         self.files_listbox = tk.Listbox(self.files_frame, height=15, selectmode=tk.MULTIPLE, font=('Segoe UI', 11))
@@ -322,7 +327,7 @@ class App(ctk.CTk):
         self.status = ctk.CTkLabel(right, text='Status: ready', anchor='w')
         self.status.pack(fill='x', padx=8, pady=(4,8))
 
-    # UI methods
+    # ----------------- UI callbacks -----------------
     def _on_device_selected(self, value):
         if not value: return
         parts = value.split(' — ')
@@ -368,11 +373,34 @@ class App(ctk.CTk):
         if not self.files_to_send:
             messagebox.showwarning('No files', 'Please add files to send.')
             return
-        pin = ctk.simpledialog.askstring('PIN required', 'Enter the temporary PIN shown on receiver (6 digits):')
-        if not pin: return
 
+        pin = self.entry_pin.get().strip()
+        if not pin:
+            messagebox.showwarning('PIN missing', 'Please enter the PIN from receiver.')
+            return
+
+        self.status.configure(text="Status: Sending...")
+        threading.Thread(target=self._do_send, args=(dev, pin), daemon=True).start()
+
+    def _do_send(self, dev, pin):
+        pin_state = self.receiver.get_pin_state()
+        if pin_state:
+            _, salt, _ = pin_state
+        else:
+            self.status.configure(text="Status: Error - PIN expired or invalid")
+            return
+
+        success, err = self.sender.send_files(dev['addr'], dev['tcp_port'], self.files_to_send, pin, salt)
+        if success:
+            self.status.configure(text=f"Status: Sent {len(self.files_to_send)} files successfully")
+            self.files_listbox.delete(0, tk.END)
+            self.files_to_send.clear()
+        else:
+            self.status.configure(text=f"Status: Error sending files: {err}")
+
+    # ----------------- Polling -----------------
     def _poll_queues(self):
-        # Poll devices queue
+        # Devices
         try:
             while True:
                 action, dev_id, info = self.device_queue.get_nowait()
@@ -391,7 +419,7 @@ class App(ctk.CTk):
         except Empty:
             pass
 
-        # Poll incoming files queue
+        # Incoming files
         try:
             while True:
                 action, filepath, filesize = self.incoming_queue.get_nowait()
@@ -400,8 +428,9 @@ class App(ctk.CTk):
         except Empty:
             pass
 
-        # Schedule next poll
         self.after(200, self._poll_queues)
+
+# ----------------------------- Main -----------------------------
 if __name__ == '__main__':
     app = App()
     app.mainloop()
