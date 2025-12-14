@@ -1,411 +1,520 @@
-import socket
-import threading
-import struct
+from __future__ import annotations
+
 import json
 import os
+import socket
+import struct
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List
-import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
 
-from security import key_agree, sha256_file
-from state import AppState, Device, TransferStatus, AppStatus
-from history import TransferRecord
-from config import Config
-from security import Identity, TrustedPeers
-
-logger = logging.getLogger(__name__)
-
-CHUNK_SIZE = 1024 * 1024  # 1MB
-STREAMS_PER_FILE = 4      # conexiuni paralele per fișier
-MAX_WORKER_THREADS = 16   # pool global pentru toate transferurile
+import security
+import storage
+from core import Core
 
 
-# ==============================
-# Multicast Discovery
-# ==============================
+# ----------------------------
+# Message framing: length-prefixed JSON and optional binary frames
+# ----------------------------
 
-class Discovery:
-    def __init__(self, state: AppState, cfg: Config):
-        self.state = state
-        self.cfg = cfg
-        self.stop_flag = False
-        self._last_payload: bytes | None = None
-
-    def start(self):
-        threading.Thread(target=self._sender, daemon=True).start()
-        threading.Thread(target=self._listener, daemon=True).start()
-
-    def _make_payload(self) -> bytes:
-        # ✅ Always read current values (name/status can change at runtime)
-        msg = {
-            "name": self.state.cfg.device_name,
-            "port": self.cfg.listen_port,
-            "status": self.state.status,
-        }
-        return json.dumps(msg).encode()
-
-    def _sender(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-
-        while not self.stop_flag:
-            try:
-                payload = self._make_payload()
-                # Send if changed OR as a keepalive every second
-                if payload != self._last_payload:
-                    self._last_payload = payload
-                sock.sendto(payload, ("239.255.255.250", self.cfg.discovery_port))
-            except Exception:
-                pass
-            time.sleep(1)
-
-    def _listener(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("", self.cfg.discovery_port))
-        sock.setsockopt(
-            socket.IPPROTO_IP,
-            socket.IP_ADD_MEMBERSHIP,
-            struct.pack("4sl", socket.inet_aton("239.255.255.250"), socket.INADDR_ANY),
-        )
-
-        while not self.stop_flag:
-            try:
-                data, addr = sock.recvfrom(2048)
-                info = json.loads(data.decode())
-                dev_id = addr[0]
-                dev = Device(dev_id, info["name"], addr[0], info["port"], info["status"])
-                self.state.upsert_device(dev)
-            except Exception:
-                pass
+def send_json(sock: socket.socket, msg: dict) -> None:
+    data = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+    sock.sendall(struct.pack("!I", len(data)) + data)
 
 
-# ==============================
-# Transfer Protocol
-# ==============================
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    chunks = []
+    got = 0
+    while got < n:
+        part = sock.recv(n - got)
+        if not part:
+            raise ConnectionError("socket closed")
+        chunks.append(part)
+        got += len(part)
+    return b"".join(chunks)
 
-def _send_json(sock, obj):
-    b = json.dumps(obj).encode()
+
+def recv_json(sock: socket.socket) -> dict:
+    (ln,) = struct.unpack("!I", recv_exact(sock, 4))
+    data = recv_exact(sock, ln)
+    return json.loads(data.decode("utf-8"))
+
+
+def send_bin(sock: socket.socket, b: bytes) -> None:
     sock.sendall(struct.pack("!I", len(b)) + b)
 
 
-def _recv_json(sock):
-    header = sock.recv(4)
-    if not header:
-        return None
-    ln = struct.unpack("!I", header)[0]
-    buf = b""
-    while len(buf) < ln:
-        chunk = sock.recv(ln - len(buf))
-        if not chunk:
-            break
-        buf += chunk
-    return json.loads(buf.decode())
+def recv_bin(sock: socket.socket) -> bytes:
+    (ln,) = struct.unpack("!I", recv_exact(sock, 4))
+    return recv_exact(sock, ln)
+
+
+# ----------------------------
+# Discovery (UDP multicast + fallback broadcast)
+# ----------------------------
+
+class DiscoveryService:
+    def __init__(self, core: Core) -> None:
+        self.core = core
+        self.cfg = core.cfg
+        self._stop = threading.Event()
+        self._tx_thread: Optional[threading.Thread] = None
+        self._rx_thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._stop.clear()
+        self._tx_thread = threading.Thread(target=self._announce_loop, daemon=True)
+        self._rx_thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._tx_thread.start()
+        self._rx_thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _announce_loop(self) -> None:
+        disc = self.cfg["discovery"]
+        udp_port = int(disc["udp_port"])
+        group = str(disc["multicast_group"])
+        interval = float(disc["announce_interval_sec"])
+        method = str(disc["method"]).lower()
+
+        tcp_port = int(self.cfg["network"]["tcp_port"])
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # multicast TTL small
+        try:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        except Exception:
+            pass
+
+        while not self._stop.is_set():
+            profile = self.core.get_profile()
+            payload = {
+                "type": "DISCOVERY",
+                "v": 1,
+                "username": profile["username"],
+                "availability": profile["availability"],
+                "tcp_port": tcp_port,
+                "ts": time.time(),
+            }
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+            try:
+                if method == "multicast":
+                    s.sendto(data, (group, udp_port))
+                else:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    s.sendto(data, ("255.255.255.255", udp_port))
+            except Exception:
+                # fallback to broadcast if multicast fails
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    s.sendto(data, ("255.255.255.255", udp_port))
+                except Exception:
+                    pass
+
+            time.sleep(interval)
+
+    def _listen_loop(self) -> None:
+        disc = self.cfg["discovery"]
+        udp_port = int(disc["udp_port"])
+        group = str(disc["multicast_group"])
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        try:
+            s.bind(("", udp_port))
+        except OSError:
+            # If bind fails, try binding to localhost (some envs)
+            s.bind(("0.0.0.0", udp_port))
+
+        # join multicast group
+        try:
+            mreq = struct.pack("=4sl", socket.inet_aton(group), socket.INADDR_ANY)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except Exception:
+            # multicast may be blocked; still receive broadcast on the port
+            pass
+
+        s.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                data, addr = s.recvfrom(64 * 1024)
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+            ip = addr[0]
+            try:
+                msg = json.loads(data.decode("utf-8", errors="ignore"))
+            except Exception:
+                continue
+            if msg.get("type") != "DISCOVERY":
+                continue
+
+            profile = self.core.get_profile()
+            # ignore our own beacons by username+tcp_port heuristic
+            if msg.get("username") == profile["username"] and int(msg.get("tcp_port", -1)) == int(self.cfg["network"]["tcp_port"]):
+                continue
+
+            username = str(msg.get("username", "Unknown"))
+            availability = str(msg.get("availability", "available")).lower()
+            tcp_port = int(msg.get("tcp_port", self.cfg["network"]["tcp_port"]))
+            peer_id = f"{username}@{ip}:{tcp_port}"
+            self.core.upsert_peer(peer_id, username, ip, tcp_port, availability)
+
+
+# ----------------------------
+# Transfer Server + Client
+# ----------------------------
+
+@dataclass
+class IncomingOffer:
+    transfer_id: str
+    sender_name: str
+    sender_peer_id: str
+    files: List[dict]         # [{"name":..., "size":...}]
+    total_bytes: int
+    sock: socket.socket       # kept open while waiting accept/reject
+    sender_pub: bytes         # identity pub bytes
 
 
 class TransferService:
-    def __init__(self, state: AppState, main_window, history):
-        self.state = state
-        self.main_window = main_window
-        self.history = history
-        self.identity = Identity()
-        self.identity.load_or_create()
-        self.trusted = TrustedPeers()
+    def __init__(self, core: Core, on_incoming_offer: Callable[[IncomingOffer], None]) -> None:
+        self.core = core
+        self.on_incoming_offer = on_incoming_offer
 
-        self.thread_pool = ThreadPoolExecutor(
-            max_workers=MAX_WORKER_THREADS,
-            thread_name_prefix="FIshare-Transfer"
-        )
+        self._stop = threading.Event()
+        self._server_thread: Optional[threading.Thread] = None
+        self._server_sock: Optional[socket.socket] = None
 
-        self.thread_pool.submit(self._listener)
+        self._active_lock = threading.RLock()
+        self._active_threads: List[threading.Thread] = []
 
-    # ==========================
-    # LISTENER (incoming)
-    # ==========================
+    def start(self) -> None:
+        self._stop.clear()
+        self._server_thread = threading.Thread(target=self._server_loop, daemon=True)
+        self._server_thread.start()
 
-    def _listener(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("", self.state.cfg.listen_port))
-        sock.listen(50)
-        logger.info(f"Transfer listener started on port {self.state.cfg.listen_port}")
-
-        while True:
-            try:
-                conn, addr = sock.accept()
-                self.thread_pool.submit(self._handle_incoming, conn, addr)
-            except Exception as e:
-                logger.error(f"Listener error: {e}")
-                break
-
-    def _handle_incoming(self, conn: socket.socket, addr):
+    def stop(self) -> None:
+        self._stop.set()
         try:
-            peer_id = addr[0]
-            aead = key_agree(conn, self.identity, self.trusted, peer_id)
-
-            meta = _recv_json(conn)
-            if not meta:
-                conn.close()
-                return
-
-            # respect busy/available (stop allowing requests)
-            if self.state.status != AppStatus.AVAILABLE:
-                _send_json(conn, {"accepted": False})
-                conn.close()
-                return
-
-            accepted = self.main_window.ask_incoming(
-                meta["peer_name"], len(meta["files"]), meta["total_size"]
-            )
-            _send_json(conn, {"accepted": accepted})
-            if not accepted:
-                conn.close()
-                return
-
-            start_time = time.time()
-            sha_ok = True
-
-            self.state.start_transfer(peer_id)
-
-            download_dir = self.state.cfg.download_dir
-            os.makedirs(download_dir, exist_ok=True)
-
-            for fmeta in meta["files"]:
-                path = os.path.join(download_dir, fmeta["name"])
-                temp_path = path + ".part"
-
-                resume_offset = 0
-                if os.path.exists(temp_path):
-                    resume_offset = os.path.getsize(temp_path)
-
-                _send_json(conn, {"resume": resume_offset})
-
-                streams = []
-                for _ in range(fmeta["streams"]):
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.connect((addr[0], fmeta["data_port"]))
-                    s = self._wrap_aead(s, aead)
-                    _send_json(s, {"file_id": fmeta["id"], "offset": resume_offset})
-                    streams.append(s)
-
-                with open(temp_path, "ab") as out:
-                    received = resume_offset
-                    total = fmeta["size"]
-                    done_flag = False
-
-                    def receiver_thread(sock_stream):
-                        nonlocal received, done_flag
-                        while not done_flag:
-                            try:
-                                chunk = sock_stream.recv(CHUNK_SIZE + 32)
-                                if not chunk:
-                                    break
-                                out.write(chunk)
-                                received += len(chunk)
-                                ratio = received / total
-                                self.state.update_progress(peer_id, ratio, received, "received")
-                                if received >= total:
-                                    done_flag = True
-                                    break
-                            except:
-                                break
-
-                    futures = []
-                    for s in streams:
-                        futures.append(self.thread_pool.submit(receiver_thread, s))
-
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            logger.error(f"Receiver thread error: {e}")
-
-                if os.path.exists(temp_path):
-                    if sha256_file(temp_path) == fmeta["sha256"]:
-                        os.rename(temp_path, path)
-                    else:
-                        sha_ok = False
-                        os.remove(temp_path)
-
-            duration = time.time() - start_time
-            status = "completed" if sha_ok else "error"
-            self.state.finish_transfer(peer_id, TransferStatus.COMPLETED if sha_ok else TransferStatus.ERROR)
-
-            rec = TransferRecord(
-                timestamp=time.time(),
-                direction="received",
-                peer_name=meta["peer_name"],
-                peer_host=addr[0],
-                num_files=len(meta["files"]),
-                total_size=meta["total_size"],
-                duration=duration,
-                status=status,
-                sha256_ok=sha_ok
-            )
-            self.history.add_record(rec)
+            if self._server_sock:
+                self._server_sock.close()
         except Exception:
             pass
-        finally:
-            conn.close()
 
-    def _wrap_aead(self, sock: socket.socket, aead):
-        class Wrapped:
-            def sendall(self_inner, data):
-                sock.sendall(aead.encrypt(data))
+    # ---------- server side ----------
 
-            def recv(self_inner, n):
-                try:
-                    enc = sock.recv(n + 32)
-                    if not enc:
-                        return b""
-                    return aead.decrypt(enc)
-                except:
-                    return b""
+    def _server_loop(self) -> None:
+        port = int(self.core.cfg["network"]["tcp_port"])
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", port))
+        srv.listen(50)
+        srv.settimeout(0.5)
+        self._server_sock = srv
 
-            def close(self_inner):
+        while not self._stop.is_set():
+            try:
+                client, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+            t = threading.Thread(target=self._handle_client, args=(client, addr), daemon=True)
+            t.start()
+            with self._active_lock:
+                self._active_threads.append(t)
+
+    def _handle_client(self, sock: socket.socket, addr: Tuple[str, int]) -> None:
+        sock.settimeout(10.0)
+        try:
+            hello = recv_json(sock)
+            if hello.get("type") != "HELLO":
                 sock.close()
+                return
 
-        return Wrapped()
+            sender_name = str(hello.get("username", "Unknown"))
+            sender_tcp = int(hello.get("tcp_port", 0))
+            sender_pub_hex = hello.get("identity_pub_hex", "")
+            sender_pub = bytes.fromhex(sender_pub_hex) if sender_pub_hex else b""
+            sender_ip = addr[0]
+            sender_peer_id = f"{sender_name}@{sender_ip}:{sender_tcp}"
 
-    # ==========================
-    # SENDER - Multi-peer support
-    # ==========================
+            # Return our identity pub
+            our_pub = security.load_identity_public_bytes()
+            send_json(sock, {"type": "HELLO_OK", "identity_pub_hex": our_pub.hex()})
 
-    def send_to_multiple(self, devices: List[Device], file_paths: List[str]):
-        if not devices or not file_paths:
-            logger.warning("No devices or files selected")
+            offer = recv_json(sock)
+            if offer.get("type") != "TRANSFER_OFFER":
+                sock.close()
+                return
+
+            transfer_id = str(offer.get("transfer_id"))
+            files = offer.get("files", [])
+            total_bytes = int(offer.get("total_bytes", 0))
+
+            incoming = IncomingOffer(
+                transfer_id=transfer_id,
+                sender_name=sender_name,
+                sender_peer_id=sender_peer_id,
+                files=files,
+                total_bytes=total_bytes,
+                sock=sock,
+                sender_pub=sender_pub,
+            )
+            # UI will decide accept/reject; keep socket open
+            self.on_incoming_offer(incoming)
+
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    # ---------- accept/reject (called by App) ----------
+
+    def reject_offer(self, offer: IncomingOffer, reason: str = "rejected") -> None:
+        try:
+            send_json(offer.sock, {"type": "TRANSFER_RESPONSE", "accept": False, "reason": reason})
+        except Exception:
+            pass
+        try:
+            offer.sock.close()
+        except Exception:
+            pass
+
+    def accept_offer(self, offer: IncomingOffer) -> None:
+        """
+        Accept and start receiving in a dedicated thread.
+        """
+        try:
+            send_json(offer.sock, {"type": "TRANSFER_RESPONSE", "accept": True})
+        except Exception:
+            try:
+                offer.sock.close()
+            except Exception:
+                pass
             return
 
-        logger.info(f"Starting multi-peer transfer to {len(devices)} device(s)")
+        t = threading.Thread(target=self._receive_files, args=(offer,), daemon=True)
+        t.start()
+        with self._active_lock:
+            self._active_threads.append(t)
 
-        futures = []
-        for device in devices:
-            future = self.thread_pool.submit(self._send_to_single, device, file_paths)
-            futures.append((device, future))
+    # ---------- receiving ----------
 
-        for device, future in futures:
-            try:
-                future.result()
-                logger.info(f"Transfer to {device.name} completed")
-            except Exception as e:
-                logger.error(f"Transfer to {device.name} failed: {e}")
+    def _receive_files(self, offer: IncomingOffer) -> None:
+        sock = offer.sock
+        transfer_id = offer.transfer_id
+        sender_peer_id = offer.sender_peer_id
+        sender_name = offer.sender_name
+        total_bytes = offer.total_bytes
 
-    def send_to(self, device: Device, file_paths: List[str]):
-        self.send_to_multiple([device], file_paths)
+        # init progress in core
+        self.core.init_transfer(transfer_id, "receive", [(sender_peer_id, sender_name)], total_bytes)
 
-    def _send_to_single(self, device: Device, file_paths: List[str]):
-        host = device.host
-        port = device.port
-        total_size = sum(os.path.getsize(f) for f in file_paths)
+        start = time.time()
+        done = 0
+        try:
+            # Handshake: exchange ephemeral keys
+            # Receiver generates ephemeral, sends to sender; sender replies with ephemeral + salt; both derive same AES key.
+            recv_eph_sk, recv_eph_pk = security.generate_ephemeral()
+            send_json(sock, {"type": "HS1", "eph_pub_hex": recv_eph_pk.hex()})
 
-        logger.info(f"Starting transfer to {device.name} ({host}:{port})")
+            hs2 = recv_json(sock)
+            if hs2.get("type") != "HS2":
+                raise ConnectionError("handshake failed")
+            sender_eph_pub = bytes.fromhex(hs2["eph_pub_hex"])
+            salt = bytes.fromhex(hs2["salt_hex"])
 
-        meta = {
-            "peer_name": self.state.cfg.device_name,
-            "files": [],
-            "total_size": total_size
-        }
+            shared = security.compute_shared_secret(recv_eph_sk, sender_eph_pub)
+            keys = security.derive_session_key(shared, salt)
 
-        data_port = port + 1
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.bind(("", data_port))
-        listener.listen(50)
+            # Now receive file stream: FILE_BEGIN (json), then repeated CHUNK (bin) frames, then FILE_END
+            download_dir = Path(self.core.get_download_dir())
+            download_dir.mkdir(parents=True, exist_ok=True)
 
-        def accept_data():
+            counter = 1
             while True:
-                try:
-                    c, a = listener.accept()
-                    yield c
-                except:
+                hdr = recv_json(sock)
+                mtype = hdr.get("type")
+                if mtype == "DONE":
                     break
+                if mtype != "FILE_BEGIN":
+                    raise ConnectionError("protocol error: expected FILE_BEGIN")
 
-        accept_iter = accept_data()
+                rel_name = str(hdr["name"])
+                fsize = int(hdr["size"])
+
+                out_path = download_dir / rel_name
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with out_path.open("wb") as f:
+                    remaining = fsize
+                    while remaining > 0:
+                        enc = recv_bin(sock)
+                        # encrypted chunk: nonce(12) + ciphertext
+                        nonce = security.make_nonce(counter)
+                        counter += 1
+                        chunk = security.aesgcm_decrypt(keys.key, nonce, enc, aad=b"chunk")
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                        done += len(chunk)
+
+                        elapsed = max(0.001, time.time() - start)
+                        speed = done / elapsed
+                        self.core.update_progress(transfer_id, sender_peer_id, done, speed, status="active")
+
+                end = recv_json(sock)
+                if end.get("type") != "FILE_END":
+                    raise ConnectionError("protocol error: expected FILE_END")
+
+            elapsed = max(0.001, time.time() - start)
+            speed = done / elapsed
+            self.core.update_progress(transfer_id, sender_peer_id, done, speed, status="completed")
+            self.core.finalize_transfer(transfer_id, "receive", [sender_name], len(offer.files), total_bytes, "completed", speed)
+
+        except Exception as e:
+            elapsed = max(0.001, time.time() - start)
+            speed = done / elapsed
+            self.core.update_progress(transfer_id, sender_peer_id, done, speed, status="error", error=str(e))
+            self.core.finalize_transfer(transfer_id, "receive", [sender_name], len(offer.files), total_bytes, "error", speed, error=str(e))
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    # ---------- sending ----------
+
+    def send_files(self, transfer_id: str, peer_ip: str, peer_tcp_port: int, peer_id: str, peer_name: str, files: List[str]) -> None:
+        """
+        Sends one transfer to one peer in a thread. App will call this multiple times for multiple receivers,
+        but limits are enforced by Core/config in app.py.
+        """
+        t = threading.Thread(
+            target=self._send_files_thread,
+            args=(transfer_id, peer_ip, peer_tcp_port, peer_id, peer_name, files),
+            daemon=True,
+        )
+        t.start()
+        with self._active_lock:
+            self._active_threads.append(t)
+
+    def _send_files_thread(self, transfer_id: str, peer_ip: str, peer_tcp_port: int, peer_id: str, peer_name: str, files: List[str]) -> None:
+        cfg = self.core.cfg
+        timeout = float(cfg["network"]["connect_timeout_sec"])
+        profile = self.core.get_profile()
+
+        # Build offer metadata
+        file_meta: List[dict] = []
+        total_bytes = 0
+        for p in files:
+            try:
+                st = os.stat(p)
+                size = int(st.st_size)
+            except Exception:
+                continue
+            name = os.path.basename(p)
+            file_meta.append({"name": name, "size": size})
+            total_bytes += size
+
+        # init progress entry if not already
+        # (Core.init_transfer is done by app for all receivers; safe to update anyway)
+        start = time.time()
+        done = 0
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((host, port))
-        aead = key_agree(sock, self.identity, self.trusted, device.device_id)
+        sock.settimeout(timeout)
+        try:
+            sock.connect((peer_ip, peer_tcp_port))
+            sock.settimeout(15.0)
 
-        for i, path in enumerate(file_paths):
-            meta["files"].append({
-                "id": i,
-                "name": os.path.basename(path),
-                "size": os.path.getsize(path),
-                "sha256": sha256_file(path),
-                "streams": STREAMS_PER_FILE,
-                "data_port": data_port
+            our_pub = security.load_identity_public_bytes()
+            send_json(sock, {
+                "type": "HELLO",
+                "username": profile["username"],
+                "tcp_port": int(cfg["network"]["tcp_port"]),
+                "identity_pub_hex": our_pub.hex(),
             })
+            hello_ok = recv_json(sock)
+            if hello_ok.get("type") != "HELLO_OK":
+                raise ConnectionError("peer did not accept HELLO")
 
-        _send_json(sock, meta)
-        resp = _recv_json(sock)
-        if not resp or not resp.get("accepted"):
-            sock.close()
-            return
+            peer_identity_pub = bytes.fromhex(hello_ok.get("identity_pub_hex", "")) if hello_ok.get("identity_pub_hex") else b""
 
-        self.state.start_transfer(device.device_id)
-        start_time = time.time()
+            # Offer
+            send_json(sock, {
+                "type": "TRANSFER_OFFER",
+                "transfer_id": transfer_id,
+                "files": file_meta,
+                "total_bytes": total_bytes,
+            })
+            resp = recv_json(sock)
+            if resp.get("type") != "TRANSFER_RESPONSE" or not resp.get("accept", False):
+                self.core.update_progress(transfer_id, peer_id, 0, 0.0, status="rejected", error=str(resp.get("reason", "rejected")))
+                self.core.finalize_transfer(transfer_id, "send", [peer_name], len(file_meta), total_bytes, "canceled", 0.0, error="rejected")
+                return
 
-        for fmeta in meta["files"]:
-            path = [p for p in file_paths if os.path.basename(p) == fmeta["name"]][0]
-            total = fmeta["size"]
+            # Handshake
+            # Sender waits HS1 (receiver eph), then replies HS2 (sender eph + salt)
+            hs1 = recv_json(sock)
+            if hs1.get("type") != "HS1":
+                raise ConnectionError("handshake failed (HS1)")
+            recv_eph_pub = bytes.fromhex(hs1["eph_pub_hex"])
+            sender_eph_sk, sender_eph_pk = security.generate_ephemeral()
+            salt = os.urandom(16)
 
-            sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock2.connect((host, port))
-            aead2 = key_agree(sock2, self.identity, self.trusted, device.device_id)
+            send_json(sock, {"type": "HS2", "eph_pub_hex": sender_eph_pk.hex(), "salt_hex": salt.hex()})
+            shared = security.compute_shared_secret(sender_eph_sk, recv_eph_pub)
+            keys = security.derive_session_key(shared, salt)
 
-            info = _recv_json(sock2)
-            sock2.close()
+            # Stream files
+            counter = 1
+            for meta, path in zip(file_meta, files):
+                name = meta["name"]
+                size = meta["size"]
 
-            offset = info["resume"]
-            streams = []
-
-            for _ in range(STREAMS_PER_FILE):
-                c = next(accept_iter)
-                wc = self._wrap_aead(c, aead)
-                _send_json(wc, {"file_id": fmeta["id"], "offset": offset})
-                streams.append(wc)
-
-            with open(path, "rb") as f:
-                f.seek(offset)
-                sent = offset
-                done_flag = False
-
-                def sender_thread(wrap_sock):
-                    nonlocal sent, done_flag
-                    while not done_flag:
-                        chunk = f.read(CHUNK_SIZE)
+                send_json(sock, {"type": "FILE_BEGIN", "name": name, "size": size})
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(int(cfg["limits"]["chunk_size_kb"]) * 1024)
                         if not chunk:
-                            done_flag = True
                             break
-                        try:
-                            wrap_sock.sendall(chunk)
-                            sent += len(chunk)
-                            ratio = sent / total
-                            self.state.update_progress(device.device_id, ratio, sent, "sent")
-                        except:
-                            break
+                        nonce = security.make_nonce(counter)
+                        counter += 1
+                        enc = security.aesgcm_encrypt(keys.key, nonce, chunk, aad=b"chunk")
+                        send_bin(sock, enc)
 
-                futures = []
-                for w in streams:
-                    futures.append(self.thread_pool.submit(sender_thread, w))
+                        done += len(chunk)
+                        elapsed = max(0.001, time.time() - start)
+                        speed = done / elapsed
+                        self.core.update_progress(transfer_id, peer_id, done, speed, status="active")
 
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"Sender thread error: {e}")
+                send_json(sock, {"type": "FILE_END", "name": name})
 
-        duration = time.time() - start_time
-        self.state.finish_transfer(device.device_id, TransferStatus.COMPLETED)
+            send_json(sock, {"type": "DONE"})
+            elapsed = max(0.001, time.time() - start)
+            speed = done / elapsed
+            self.core.update_progress(transfer_id, peer_id, done, speed, status="completed")
+            self.core.finalize_transfer(transfer_id, "send", [peer_name], len(file_meta), total_bytes, "completed", speed)
 
-        rec = TransferRecord(
-            timestamp=time.time(),
-            direction="sent",
-            peer_name=device.name,
-            peer_host=device.host,
-            num_files=len(file_paths),
-            total_size=total_size,
-            duration=duration,
-            status="completed",
-            sha256_ok=True
-        )
-        self.history.add_record(rec)
+        except Exception as e:
+            elapsed = max(0.001, time.time() - start)
+            speed = done / elapsed
+            self.core.update_progress(transfer_id, peer_id, done, speed, status="error", error=str(e))
+            self.core.finalize_transfer(transfer_id, "send", [peer_name], len(file_meta), total_bytes, "error", speed, error=str(e))
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass

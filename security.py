@@ -1,6 +1,13 @@
-import os
+from __future__ import annotations
+
 import json
-import hashlib
+import os
+import secrets
+import threading
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
+from typing import Optional, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
@@ -8,154 +15,144 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from config import KEY_FILE, DATA_DIR, TRUSTED_PEERS_FILE
+import storage
 
 
-class AEADStream:
-    def __init__(self, key: bytes):
-        self._aead = ChaCha20Poly1305(key)
-        self._send_nonce = 0
-        self._recv_nonce = 0
-
-    def _n2b(self, n: int) -> bytes:
-        return n.to_bytes(12, "big")
-
-    def encrypt(self, data: bytes) -> bytes:
-        nonce = self._n2b(self._send_nonce)
-        self._send_nonce += 1
-        return self._aead.encrypt(nonce, data, b"FIshare")
-
-    def decrypt(self, data: bytes) -> bytes:
-        nonce = self._n2b(self._recv_nonce)
-        self._recv_nonce += 1
-        return self._aead.decrypt(nonce, data, b"FIshare")
+_LOCK = threading.RLock()
 
 
-class Identity:
-    def __init__(self):
-        self._priv = None
-        self._pub = None
+def _trusted_peers_path() -> Path:
+    # Trust-on-first-use database: peer_id -> fingerprint
+    return storage.keys_dir() / "trusted_peers.json"
 
-    def load_or_create(self):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        if os.path.exists(KEY_FILE):
-            with open(KEY_FILE, "rb") as f:
-                self._priv = serialization.load_pem_private_key(f.read(), password=None)
-        else:
-            self._priv = ed25519.Ed25519PrivateKey.generate()
-            pem = self._priv.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
-            with open(KEY_FILE, "wb") as f:
-                f.write(pem)
-        self._pub = self._priv.public_key()
 
-    def sign(self, data: bytes) -> bytes:
-        return self._priv.sign(data)
+def _load_trusted() -> dict:
+    p = _trusted_peers_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
-    def public_bytes(self) -> bytes:
-        return self._pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
+
+def _save_trusted(data: dict) -> None:
+    p = _trusted_peers_path()
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def fingerprint_pubkey(pub_bytes: bytes) -> str:
+    return sha256(pub_bytes).hexdigest()
+
+
+def _identity_key_paths() -> tuple[str, str]:
+    return ("identity_private.key", "identity_public.key")
+
+
+def ensure_identity_keypair() -> Tuple[bytes, bytes]:
+    """
+    Returns (private_bytes, public_bytes). Generates and stores if missing.
+    """
+    with _LOCK:
+        priv_name, pub_name = _identity_key_paths()
+        priv = storage.read_key_bytes(priv_name)
+        pub = storage.read_key_bytes(pub_name)
+
+        if priv and pub:
+            return priv, pub
+
+        sk = X25519PrivateKey.generate()
+        pk = sk.public_key()
+
+        priv_bytes = sk.private_bytes(
+            encoding=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.Encoding.Raw,
+            format=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.PrivateFormat.Raw,
+            encryption_algorithm=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.NoEncryption(),
+        )
+        pub_bytes = pk.public_bytes(
+            encoding=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.Encoding.Raw,
+            format=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.PublicFormat.Raw,
         )
 
-
-class TrustedPeers:
-    def __init__(self):
-        self._path = TRUSTED_PEERS_FILE
-        self._peers = {}
-        self._load()
-
-    def _load(self):
-        try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                self._peers = json.load(f)
-        except Exception:
-            self._peers = {}
-
-    def save(self):
-        try:
-            with open(self._path, "w", encoding="utf-8") as f:
-                json.dump(self._peers, f, indent=2)
-        except Exception:
-            pass
-
-    def get_peer_key(self, peer_id: str) -> bytes | None:
-        hex_key = self._peers.get(peer_id)
-        if not hex_key:
-            return None
-        return bytes.fromhex(hex_key)
-
-    def remember_peer(self, peer_id: str, pub_key: bytes):
-        self._peers[peer_id] = pub_key.hex()
-        self.save()
+        storage.write_key_bytes(priv_name, priv_bytes)
+        storage.write_key_bytes(pub_name, pub_bytes)
+        return priv_bytes, pub_bytes
 
 
-def key_agree(sock, identity: Identity, trusted_peers: TrustedPeers, peer_id: str | None) -> AEADStream:
-    """
-    Handshake:
-    - fiecare parte trimite: ephemeral_x25519_pub, identity_ed25519_pub, signature(ed25519, ephemeral)
-    - dacă avem cheie salvată pentru peer_id, verificăm că identity_pub corespunde (pinning)
-    - derivăm cheia de sesiune din ECDH (X25519 + HKDF)
-    """
-    eph_priv = X25519PrivateKey.generate()
-    eph_pub_bytes = eph_priv.public_key().public_bytes_raw()
-    id_pub_bytes = identity.public_bytes()
-    sig = identity.sign(eph_pub_bytes)
+def load_identity_private() -> X25519PrivateKey:
+    priv_bytes, _ = ensure_identity_keypair()
+    return X25519PrivateKey.from_private_bytes(priv_bytes)
 
-    def send_block(b: bytes):
-        sock.sendall(len(b).to_bytes(2, "big") + b)
 
-    def recv_block() -> bytes:
-        ln = int.from_bytes(sock.recv(2), "big")
-        buf = b""
-        while len(buf) < ln:
-            chunk = sock.recv(ln - len(buf))
-            if not chunk:
-                break
-            buf += chunk
-        return buf
+def load_identity_public_bytes() -> bytes:
+    _, pub_bytes = ensure_identity_keypair()
+    return pub_bytes
 
-    send_block(eph_pub_bytes)
-    send_block(id_pub_bytes)
-    send_block(sig)
 
-    peer_eph_pub = recv_block()
-    peer_id_pub = recv_block()
-    peer_sig = recv_block()
+@dataclass(frozen=True)
+class SessionKeys:
+    key: bytes  # 32 bytes AES key
 
-    if peer_id:
-        saved = trusted_peers.get_peer_key(peer_id)
-        if saved and saved != peer_id_pub:
-            raise ValueError("Peer identity changed (possible MITM)")
 
-    ed25519.Ed25519PublicKey.from_public_bytes(peer_id_pub).verify(peer_sig, peer_eph_pub)
-
-    if peer_id and not trusted_peers.get_peer_key(peer_id):
-        trusted_peers.remember_peer(peer_id, peer_id_pub)
-
-    peer_eph_key = X25519PublicKey.from_public_bytes(peer_eph_pub)
-    shared = eph_priv.exchange(peer_eph_key)
-
-    key = HKDF(
+def derive_session_key(shared_secret: bytes, salt: bytes, info: bytes = b"lan-file-transfer-v1") -> SessionKeys:
+    hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=None,
-        info=b"FIshare-key-v2",
-    ).derive(shared)
+        salt=salt,
+        info=info,
+    )
+    key = hkdf.derive(shared_secret)
+    return SessionKeys(key=key)
 
-    return AEADStream(key)
+
+def aesgcm_encrypt(key: bytes, nonce12: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
+    return AESGCM(key).encrypt(nonce12, plaintext, aad)
 
 
-def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def aesgcm_decrypt(key: bytes, nonce12: bytes, ciphertext: bytes, aad: bytes = b"") -> bytes:
+    return AESGCM(key).decrypt(nonce12, ciphertext, aad)
+
+
+def make_nonce(counter: int) -> bytes:
+    # 12 bytes nonce (safe if counter never repeats for same key)
+    return counter.to_bytes(12, "big", signed=False)
+
+
+def check_or_pin_peer(peer_id: str, peer_pub_bytes: bytes) -> Tuple[bool, Optional[str]]:
+    """
+    Returns (ok, reason). Implements TOFU:
+    - If peer_id unseen -> pins its fingerprint (requires UI prompt if in prompt-mode).
+    - If seen and fingerprint differs -> suspicious.
+    This function does not prompt; it just checks.
+    """
+    with _LOCK:
+        trusted = _load_trusted()
+        fp = fingerprint_pubkey(peer_pub_bytes)
+        if peer_id not in trusted:
+            return False, "untrusted"
+        if trusted[peer_id] != fp:
+            return False, "key_mismatch"
+        return True, None
+
+
+def pin_peer(peer_id: str, peer_pub_bytes: bytes) -> None:
+    with _LOCK:
+        trusted = _load_trusted()
+        trusted[peer_id] = fingerprint_pubkey(peer_pub_bytes)
+        _save_trusted(trusted)
+
+
+def generate_ephemeral() -> Tuple[X25519PrivateKey, bytes]:
+    sk = X25519PrivateKey.generate()
+    pk = sk.public_key().public_bytes(
+        encoding=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.Encoding.Raw,
+        format=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.PublicFormat.Raw,
+    )
+    return sk, pk
+
+
+def compute_shared_secret(our_sk: X25519PrivateKey, their_pk_bytes: bytes) -> bytes:
+    their_pk = X25519PublicKey.from_public_bytes(their_pk_bytes)
+    return our_sk.exchange(their_pk)
