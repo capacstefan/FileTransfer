@@ -76,6 +76,29 @@ class DiscoveryService:
         self.core = core
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
+        self._local_ips = self._get_local_ips()
+
+    @staticmethod
+    def _get_local_ips() -> set:
+        """Collect local interface IPs to avoid skipping peers with same username"""
+        import socket
+        ips = set()
+        try:
+            hostname = socket.gethostname()
+            try:
+                ips.add(socket.gethostbyname(hostname))
+            except Exception:
+                pass
+            try:
+                for info in socket.getaddrinfo(hostname, None):
+                    ips.add(info[4][0])
+            except Exception:
+                pass
+        except Exception:
+            pass
+        ips.discard("127.0.0.1")
+        ips.discard("::1")
+        return ips
     
     def start(self) -> None:
         """Start discovery service"""
@@ -186,9 +209,8 @@ class DiscoveryService:
                 availability = str(msg.get("availability", "available"))
                 tcp_port = int(msg.get("tcp_port", 49222))
                 
-                # Ignore our own announcements
-                my_username = self.core.get_profile()["username"]
-                if username == my_username and tcp_port == my_tcp_port:
+                # Ignore our own announcements (match by local IP + port)
+                if ip in self._local_ips and tcp_port == my_tcp_port:
                     continue
                 
                 peer_id = f"{username}@{ip}:{tcp_port}"
