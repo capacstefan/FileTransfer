@@ -1,158 +1,198 @@
+"""
+Security module - Cryptographic operations
+- Ed25519 for identity (signing)
+- X25519 for key exchange (ECDH)
+- ChaCha20-Poly1305 for authenticated encryption
+"""
 from __future__ import annotations
 
-import json
+import hashlib
 import os
 import secrets
-import threading
-from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple, Optional
 
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey,
-    X25519PublicKey,
-)
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-import storage
+from storage import KEYS_DIR
 
-
-_LOCK = threading.RLock()
-
-
-def _trusted_peers_path() -> Path:
-    # Trust-on-first-use database: peer_id -> fingerprint
-    return storage.keys_dir() / "trusted_peers.json"
+# Key file paths
+IDENTITY_PRIVATE_KEY = KEYS_DIR / "identity_ed25519.pem"
+IDENTITY_PUBLIC_KEY = KEYS_DIR / "identity_ed25519.pub"
 
 
-def _load_trusted() -> dict:
-    p = _trusted_peers_path()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+# ============================================================
+# Identity Keys (Ed25519) - Long-term identity
+# ============================================================
+
+def ensure_identity_keypair() -> None:
+    """Generate identity keypair if not exists"""
+    if IDENTITY_PRIVATE_KEY.exists():
+        return
+    
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    
+    # Save private key
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    IDENTITY_PRIVATE_KEY.write_bytes(private_pem)
+    
+    # Save public key
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    IDENTITY_PUBLIC_KEY.write_bytes(public_pem)
 
 
-def _save_trusted(data: dict) -> None:
-    p = _trusted_peers_path()
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def load_identity_private_key() -> ed25519.Ed25519PrivateKey:
+    """Load identity private key"""
+    ensure_identity_keypair()
+    pem_data = IDENTITY_PRIVATE_KEY.read_bytes()
+    return serialization.load_pem_private_key(pem_data, password=None)
 
 
-def fingerprint_pubkey(pub_bytes: bytes) -> str:
-    return sha256(pub_bytes).hexdigest()
-
-
-def _identity_key_paths() -> tuple[str, str]:
-    return ("identity_private.key", "identity_public.key")
-
-
-def ensure_identity_keypair() -> Tuple[bytes, bytes]:
-    """
-    Returns (private_bytes, public_bytes). Generates and stores if missing.
-    """
-    with _LOCK:
-        priv_name, pub_name = _identity_key_paths()
-        priv = storage.read_key_bytes(priv_name)
-        pub = storage.read_key_bytes(pub_name)
-
-        if priv and pub:
-            return priv, pub
-
-        sk = X25519PrivateKey.generate()
-        pk = sk.public_key()
-
-        priv_bytes = sk.private_bytes(
-            encoding=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.Encoding.Raw,
-            format=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.PrivateFormat.Raw,
-            encryption_algorithm=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.NoEncryption(),
-        )
-        pub_bytes = pk.public_bytes(
-            encoding=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.Encoding.Raw,
-            format=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.PublicFormat.Raw,
-        )
-
-        storage.write_key_bytes(priv_name, priv_bytes)
-        storage.write_key_bytes(pub_name, pub_bytes)
-        return priv_bytes, pub_bytes
-
-
-def load_identity_private() -> X25519PrivateKey:
-    priv_bytes, _ = ensure_identity_keypair()
-    return X25519PrivateKey.from_private_bytes(priv_bytes)
+def load_identity_public_key() -> ed25519.Ed25519PublicKey:
+    """Load identity public key"""
+    ensure_identity_keypair()
+    pem_data = IDENTITY_PUBLIC_KEY.read_bytes()
+    return serialization.load_pem_public_key(pem_data)
 
 
 def load_identity_public_bytes() -> bytes:
-    _, pub_bytes = ensure_identity_keypair()
-    return pub_bytes
+    """Get raw public key bytes (32 bytes)"""
+    pub = load_identity_public_key()
+    return pub.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
 
 
-@dataclass(frozen=True)
-class SessionKeys:
-    key: bytes  # 32 bytes AES key
+def sign_message(message: bytes) -> bytes:
+    """Sign a message with identity key"""
+    private_key = load_identity_private_key()
+    return private_key.sign(message)
 
 
-def derive_session_key(shared_secret: bytes, salt: bytes, info: bytes = b"lan-file-transfer-v1") -> SessionKeys:
-    hkdf = HKDF(
+def verify_signature(public_key_bytes: bytes, message: bytes, signature: bytes) -> bool:
+    """Verify signature from peer's public key"""
+    try:
+        public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
+        public_key.verify(signature, message)
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# Ephemeral Keys (X25519) - Per-session key exchange
+# ============================================================
+
+def generate_ephemeral() -> Tuple[x25519.X25519PrivateKey, bytes]:
+    """Generate ephemeral X25519 keypair for ECDH
+    Returns: (private_key, public_key_bytes)
+    """
+    private_key = x25519.X25519PrivateKey.generate()
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    return private_key, public_bytes
+
+
+def compute_shared_secret(
+    our_private: x25519.X25519PrivateKey,
+    their_public_bytes: bytes
+) -> bytes:
+    """Compute shared secret via ECDH"""
+    their_public = x25519.X25519PublicKey.from_public_bytes(their_public_bytes)
+    return our_private.exchange(their_public)
+
+
+def derive_session_keys(shared_secret: bytes, salt: bytes) -> Tuple[bytes, bytes]:
+    """Derive symmetric keys from shared secret using HKDF
+    Returns: (encrypt_key, decrypt_key) - both 32 bytes
+    """
+    # Use HKDF to derive 64 bytes, split into two 32-byte keys
+    derived = HKDF(
         algorithm=hashes.SHA256(),
-        length=32,
+        length=64,
         salt=salt,
-        info=info,
-    )
-    key = hkdf.derive(shared_secret)
-    return SessionKeys(key=key)
+        info=b"FIshare-session-v1",
+    ).derive(shared_secret)
+    
+    return derived[:32], derived[32:]
 
 
-def aesgcm_encrypt(key: bytes, nonce12: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
-    return AESGCM(key).encrypt(nonce12, plaintext, aad)
+# ============================================================
+# Symmetric Encryption (ChaCha20-Poly1305)
+# ============================================================
+
+class SecureChannel:
+    """Authenticated encryption channel using ChaCha20-Poly1305"""
+    
+    NONCE_SIZE = 12  # 96 bits
+    TAG_SIZE = 16    # 128 bits (included in ciphertext)
+    
+    def __init__(self, encrypt_key: bytes, decrypt_key: bytes):
+        self._encryptor = ChaCha20Poly1305(encrypt_key)
+        self._decryptor = ChaCha20Poly1305(decrypt_key)
+        self._encrypt_counter = 0
+        self._decrypt_counter = 0
+    
+    def _counter_to_nonce(self, counter: int) -> bytes:
+        """Convert counter to nonce"""
+        return counter.to_bytes(self.NONCE_SIZE, "big")
+    
+    def encrypt(self, plaintext: bytes, associated_data: bytes = b"") -> bytes:
+        """Encrypt data with authentication
+        Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
+        """
+        nonce = self._counter_to_nonce(self._encrypt_counter)
+        self._encrypt_counter += 1
+        ciphertext = self._encryptor.encrypt(nonce, plaintext, associated_data)
+        return nonce + ciphertext
+    
+    def decrypt(self, data: bytes, associated_data: bytes = b"") -> bytes:
+        """Decrypt and verify data
+        Input: nonce (12 bytes) + ciphertext + tag (16 bytes)
+        """
+        if len(data) < self.NONCE_SIZE + self.TAG_SIZE:
+            raise ValueError("Data too short")
+        
+        nonce = data[:self.NONCE_SIZE]
+        ciphertext = data[self.NONCE_SIZE:]
+        
+        plaintext = self._decryptor.decrypt(nonce, ciphertext, associated_data)
+        self._decrypt_counter += 1
+        return plaintext
 
 
-def aesgcm_decrypt(key: bytes, nonce12: bytes, ciphertext: bytes, aad: bytes = b"") -> bytes:
-    return AESGCM(key).decrypt(nonce12, ciphertext, aad)
+def generate_salt() -> bytes:
+    """Generate random salt for key derivation"""
+    return secrets.token_bytes(32)
 
 
-def make_nonce(counter: int) -> bytes:
-    # 12 bytes nonce (safe if counter never repeats for same key)
-    return counter.to_bytes(12, "big", signed=False)
+# ============================================================
+# File Hashing
+# ============================================================
+
+def hash_file_sha256(filepath: Path, chunk_size: int = 1048576) -> str:
+    """Compute SHA-256 hash of file"""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def check_or_pin_peer(peer_id: str, peer_pub_bytes: bytes) -> Tuple[bool, Optional[str]]:
-    """
-    Returns (ok, reason). Implements TOFU:
-    - If peer_id unseen -> pins its fingerprint (requires UI prompt if in prompt-mode).
-    - If seen and fingerprint differs -> suspicious.
-    This function does not prompt; it just checks.
-    """
-    with _LOCK:
-        trusted = _load_trusted()
-        fp = fingerprint_pubkey(peer_pub_bytes)
-        if peer_id not in trusted:
-            return False, "untrusted"
-        if trusted[peer_id] != fp:
-            return False, "key_mismatch"
-        return True, None
-
-
-def pin_peer(peer_id: str, peer_pub_bytes: bytes) -> None:
-    with _LOCK:
-        trusted = _load_trusted()
-        trusted[peer_id] = fingerprint_pubkey(peer_pub_bytes)
-        _save_trusted(trusted)
-
-
-def generate_ephemeral() -> Tuple[X25519PrivateKey, bytes]:
-    sk = X25519PrivateKey.generate()
-    pk = sk.public_key().public_bytes(
-        encoding=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.Encoding.Raw,
-        format=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.PublicFormat.Raw,
-    )
-    return sk, pk
-
-
-def compute_shared_secret(our_sk: X25519PrivateKey, their_pk_bytes: bytes) -> bytes:
-    their_pk = X25519PublicKey.from_public_bytes(their_pk_bytes)
-    return our_sk.exchange(their_pk)
+def hash_bytes_sha256(data: bytes) -> str:
+    """Compute SHA-256 hash of bytes"""
+    return hashlib.sha256(data).hexdigest()

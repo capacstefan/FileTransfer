@@ -1,1 +1,8 @@
+# FIshare - LAN File Transfer Application
+# Install dependencies: pip install -r requirements.txt
+
+# GUI Framework
+PyQt6>=6.4.0
+
+# Cryptography (Ed25519, X25519, ChaCha20-Poly1305)
 cryptography>=41.0.0
