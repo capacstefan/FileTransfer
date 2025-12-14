@@ -104,7 +104,6 @@ def key_agree(sock, identity: Identity, trusted_peers: TrustedPeers, peer_id: st
     - dacă avem cheie salvată pentru peer_id, verificăm că identity_pub corespunde (pinning)
     - derivăm cheia de sesiune din ECDH (X25519 + HKDF)
     """
-    # generate local ephemeral
     eph_priv = X25519PrivateKey.generate()
     eph_pub_bytes = eph_priv.public_key().public_bytes_raw()
     id_pub_bytes = identity.public_bytes()
@@ -123,26 +122,21 @@ def key_agree(sock, identity: Identity, trusted_peers: TrustedPeers, peer_id: st
             buf += chunk
         return buf
 
-    # send
     send_block(eph_pub_bytes)
     send_block(id_pub_bytes)
     send_block(sig)
 
-    # recv
     peer_eph_pub = recv_block()
     peer_id_pub = recv_block()
     peer_sig = recv_block()
 
-    # pinning: dacă avem cheie pentru peer_id, trebuie să coincidă
     if peer_id:
         saved = trusted_peers.get_peer_key(peer_id)
         if saved and saved != peer_id_pub:
             raise ValueError("Peer identity changed (possible MITM)")
 
-    # verify signature
     ed25519.Ed25519PublicKey.from_public_bytes(peer_id_pub).verify(peer_sig, peer_eph_pub)
 
-    # dacă nu aveam peer salvat, îl salvăm acum
     if peer_id and not trusted_peers.get_peer_key(peer_id):
         trusted_peers.remember_peer(peer_id, peer_id_pub)
 

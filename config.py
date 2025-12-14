@@ -30,7 +30,7 @@ class Storage:
     @staticmethod
     def save(obj) -> None:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(asdict(obj), f, indent=2)
+            json.dump(asdict(obj), f, indent=2, ensure_ascii=False)
 
 
 @dataclass
@@ -40,7 +40,7 @@ class Config:
     allow_incoming: bool = True
     listen_port: int = 49222
     discovery_port: int = 49221
-    max_parallel_transfers: int = 4  # multi-stream: câte fișiere în paralel
+    max_parallel_transfers: int = 4  # (păstrat pentru compatibilitate)
 
     @staticmethod
     def load():
@@ -49,6 +49,13 @@ class Config:
             os.makedirs(cfg.download_dir, exist_ok=True)
         except Exception:
             pass
+
+        # ✅ IMPORTANT: creează config.json chiar la primul start
+        try:
+            cfg.save()
+        except Exception:
+            pass
+
         return cfg
 
     def save(self):
@@ -63,6 +70,7 @@ def setup_logging():
 
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
+
     fh = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
     fh.setFormatter(fmt)
 

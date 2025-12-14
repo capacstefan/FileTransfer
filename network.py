@@ -9,7 +9,7 @@ from typing import List
 import logging
 
 from security import key_agree, sha256_file
-from state import AppState, Device, TransferStatus
+from state import AppState, Device, TransferStatus, AppStatus
 from history import TransferRecord
 from config import Config
 from security import Identity, TrustedPeers
@@ -30,31 +30,45 @@ class Discovery:
         self.state = state
         self.cfg = cfg
         self.stop_flag = False
+        self._last_payload: bytes | None = None
 
     def start(self):
         threading.Thread(target=self._sender, daemon=True).start()
         threading.Thread(target=self._listener, daemon=True).start()
 
-    def _sender(self):
-        msg = json.dumps({
+    def _make_payload(self) -> bytes:
+        # ✅ Always read current values (name/status can change at runtime)
+        msg = {
             "name": self.state.cfg.device_name,
             "port": self.cfg.listen_port,
-            "status": self.state.status
-        }).encode()
+            "status": self.state.status,
+        }
+        return json.dumps(msg).encode()
 
+    def _sender(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
 
         while not self.stop_flag:
-            sock.sendto(msg, ("239.255.255.250", self.cfg.discovery_port))
+            try:
+                payload = self._make_payload()
+                # Send if changed OR as a keepalive every second
+                if payload != self._last_payload:
+                    self._last_payload = payload
+                sock.sendto(payload, ("239.255.255.250", self.cfg.discovery_port))
+            except Exception:
+                pass
             time.sleep(1)
 
     def _listener(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("", self.cfg.discovery_port))
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                        struct.pack("4sl", socket.inet_aton("239.255.255.250"), socket.INADDR_ANY))
+        sock.setsockopt(
+            socket.IPPROTO_IP,
+            socket.IP_ADD_MEMBERSHIP,
+            struct.pack("4sl", socket.inet_aton("239.255.255.250"), socket.INADDR_ANY),
+        )
 
         while not self.stop_flag:
             try:
@@ -98,14 +112,12 @@ class TransferService:
         self.identity = Identity()
         self.identity.load_or_create()
         self.trusted = TrustedPeers()
-        
-        # Thread pool global pentru toate conexiunile
+
         self.thread_pool = ThreadPoolExecutor(
             max_workers=MAX_WORKER_THREADS,
             thread_name_prefix="FIshare-Transfer"
         )
-        
-        # Pornește listener-ul în pool-ul de thread-uri
+
         self.thread_pool.submit(self._listener)
 
     # ==========================
@@ -121,7 +133,6 @@ class TransferService:
         while True:
             try:
                 conn, addr = sock.accept()
-                # Folosește thread pool în loc de thread-uri raw
                 self.thread_pool.submit(self._handle_incoming, conn, addr)
             except Exception as e:
                 logger.error(f"Listener error: {e}")
@@ -137,7 +148,12 @@ class TransferService:
                 conn.close()
                 return
 
-            # UI confirm dialog
+            # respect busy/available (stop allowing requests)
+            if self.state.status != AppStatus.AVAILABLE:
+                _send_json(conn, {"accepted": False})
+                conn.close()
+                return
+
             accepted = self.main_window.ask_incoming(
                 meta["peer_name"], len(meta["files"]), meta["total_size"]
             )
@@ -158,14 +174,12 @@ class TransferService:
                 path = os.path.join(download_dir, fmeta["name"])
                 temp_path = path + ".part"
 
-                # resume: ce avem deja?
                 resume_offset = 0
                 if os.path.exists(temp_path):
                     resume_offset = os.path.getsize(temp_path)
 
                 _send_json(conn, {"resume": resume_offset})
 
-                # multi-stream: creează sub-conexiuni
                 streams = []
                 for _ in range(fmeta["streams"]):
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -174,11 +188,9 @@ class TransferService:
                     _send_json(s, {"file_id": fmeta["id"], "offset": resume_offset})
                     streams.append(s)
 
-                # scriere fișier
                 with open(temp_path, "ab") as out:
                     received = resume_offset
                     total = fmeta["size"]
-
                     done_flag = False
 
                     def receiver_thread(sock_stream):
@@ -198,20 +210,16 @@ class TransferService:
                             except:
                                 break
 
-                    # Folosește thread pool pentru receiver threads
                     futures = []
                     for s in streams:
-                        future = self.thread_pool.submit(receiver_thread, s)
-                        futures.append(future)
+                        futures.append(self.thread_pool.submit(receiver_thread, s))
 
-                    # Așteaptă finalizarea tuturor stream-urilor
                     for future in as_completed(futures):
                         try:
                             future.result()
                         except Exception as e:
                             logger.error(f"Receiver thread error: {e}")
 
-                # verificare SHA-256
                 if os.path.exists(temp_path):
                     if sha256_file(temp_path) == fmeta["sha256"]:
                         os.rename(temp_path, path)
@@ -241,7 +249,6 @@ class TransferService:
             conn.close()
 
     def _wrap_aead(self, sock: socket.socket, aead):
-        """ Returnează un wrapper simplu cu encrypt/decrypt în send/recv. """
         class Wrapped:
             def sendall(self_inner, data):
                 sock.sendall(aead.encrypt(data))
@@ -265,37 +272,32 @@ class TransferService:
     # ==========================
 
     def send_to_multiple(self, devices: List[Device], file_paths: List[str]):
-        """Trimite fișiere către mai multe dispozitive simultan folosind thread pool."""
         if not devices or not file_paths:
             logger.warning("No devices or files selected")
             return
-        
+
         logger.info(f"Starting multi-peer transfer to {len(devices)} device(s)")
-        
-        # Lansează transferuri paralele pentru fiecare device
+
         futures = []
         for device in devices:
             future = self.thread_pool.submit(self._send_to_single, device, file_paths)
             futures.append((device, future))
-        
-        # Monitorizează progresul
+
         for device, future in futures:
             try:
-                future.result()  # Așteaptă finalizarea
+                future.result()
                 logger.info(f"Transfer to {device.name} completed")
             except Exception as e:
                 logger.error(f"Transfer to {device.name} failed: {e}")
-    
+
     def send_to(self, device: Device, file_paths: List[str]):
-        """Wrapper pentru compatibilitate - trimite către un singur device."""
         self.send_to_multiple([device], file_paths)
 
     def _send_to_single(self, device: Device, file_paths: List[str]):
-        """Transferă fișiere către un singur device (rulează în thread pool)."""
         host = device.host
         port = device.port
         total_size = sum(os.path.getsize(f) for f in file_paths)
-        
+
         logger.info(f"Starting transfer to {device.name} ({host}:{port})")
 
         meta = {
@@ -304,7 +306,6 @@ class TransferService:
             "total_size": total_size
         }
 
-        # pregătim port data pentru fluxuri paralele
         data_port = port + 1
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.bind(("", data_port))
@@ -320,12 +321,10 @@ class TransferService:
 
         accept_iter = accept_data()
 
-        # handshake
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((host, port))
         aead = key_agree(sock, self.identity, self.trusted, device.device_id)
 
-        # pregătim meta per fișier
         for i, path in enumerate(file_paths):
             meta["files"].append({
                 "id": i,
@@ -345,17 +344,15 @@ class TransferService:
         self.state.start_transfer(device.device_id)
         start_time = time.time()
 
-        # transfer fișiere
         for fmeta in meta["files"]:
             path = [p for p in file_paths if os.path.basename(p) == fmeta["name"]][0]
             total = fmeta["size"]
 
-            # resume offset
             sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock2.connect((host, port))
             aead2 = key_agree(sock2, self.identity, self.trusted, device.device_id)
 
-            info = _recv_json(sock2)  # {"resume": offset}
+            info = _recv_json(sock2)
             sock2.close()
 
             offset = info["resume"]
@@ -370,7 +367,6 @@ class TransferService:
             with open(path, "rb") as f:
                 f.seek(offset)
                 sent = offset
-
                 done_flag = False
 
                 def sender_thread(wrap_sock):
@@ -388,13 +384,10 @@ class TransferService:
                         except:
                             break
 
-                # Folosește thread pool pentru sender threads
                 futures = []
                 for w in streams:
-                    future = self.thread_pool.submit(sender_thread, w)
-                    futures.append(future)
+                    futures.append(self.thread_pool.submit(sender_thread, w))
 
-                # Așteaptă finalizarea tuturor stream-urilor
                 for future in as_completed(futures):
                     try:
                         future.result()

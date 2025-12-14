@@ -9,32 +9,23 @@ from main_window import FIshareQtApp
 
 
 def main():
-    """
-    FIshare - Modern File Transfer Application
-    Main entry point for the application
-    """
     setup_logging()
 
-    # Initialize configuration and state
     cfg = Config.load()
     state = AppState(cfg)
     history = TransferHistory()
 
-    # Create Qt application
     app = QApplication(sys.argv)
     app.setApplicationName("FIshare")
     app.setOrganizationName("FIshare")
 
-    # Initialize network discovery
     discovery = Discovery(state, cfg)
     discovery.start()
 
-    # Initialize transfer service
     transfer = TransferService(state, None, history)
 
-    # Create and show main window
     win = FIshareQtApp(state, discovery, discovery, history, transfer)
-    transfer.main_window = win  # needed for incoming transfer popup
+    transfer.main_window = win
     win.show()
 
     sys.exit(app.exec())
