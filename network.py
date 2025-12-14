@@ -419,13 +419,12 @@ class TransferService:
     def _receive_files(self, offer: IncomingOffer) -> None:
         """Receive files from sender (runs in thread pool)"""
         sock = offer.sock
-        transfer_id = offer.offer_id
         
         # Create file infos
         file_infos = [FileInfo(name=f["name"], path="", size=f["size"]) for f in offer.files]
         
         # Register transfer in core
-        self.core.create_transfer(
+        transfer_id = self.core.create_transfer(
             direction=TransferDirection.RECEIVE,
             peer_id=f"{offer.sender_name}@{offer.sender_ip}:{offer.sender_port}",
             peer_name=offer.sender_name,

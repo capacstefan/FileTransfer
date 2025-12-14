@@ -201,7 +201,22 @@ class Core:
         with self._lock:
             avail = Availability.AVAILABLE if availability == "available" else Availability.BUSY
             
-            if peer_id in self._peers:
+            # If the device changed username but keeps the same ip:port, reuse the same entry
+            existing_id = None
+            for pid, p in self._peers.items():
+                if p.ip == ip and p.port == port:
+                    existing_id = pid
+                    break
+
+            if existing_id and existing_id != peer_id:
+                peer = self._peers.pop(existing_id)
+                peer.peer_id = peer_id
+                peer.username = username
+                peer.availability = avail
+                peer.last_seen = time.time()
+                self._peers[peer_id] = peer
+                self._emit(Event(EventType.PEER_UPDATED, peer))
+            elif peer_id in self._peers:
                 peer = self._peers[peer_id]
                 peer.username = username
                 peer.availability = avail

@@ -1,0 +1,30 @@
+[
+  {
+    "transfer_id": "47fc0e57",
+    "timestamp": 1765753109.4011805,
+    "direction": "send",
+    "peer_name": "DESKTOP-BMCQJ",
+    "peer_host": "192.168.1.132",
+    "num_files": 3,
+    "total_bytes": 7655701,
+    "duration_sec": 0.0,
+    "status": "error",
+    "error_msg": "Connection closed",
+    "avg_speed_mbps": 0.0,
+    "sha256_verified": null
+  },
+  {
+    "transfer_id": "39c1209a",
+    "timestamp": 1765753008.4282484,
+    "direction": "send",
+    "peer_name": "DESKTOP-BMCQJI8",
+    "peer_host": "192.168.1.132",
+    "num_files": 1,
+    "total_bytes": 84964,
+    "duration_sec": 0.0,
+    "status": "error",
+    "error_msg": "Connection closed",
+    "avg_speed_mbps": 0.0,
+    "sha256_verified": null
+  }
+]
