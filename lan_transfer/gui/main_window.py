@@ -20,7 +20,8 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
-    QComboBox,
+    QCheckBox,
+    QHeaderView,
 )
 
 from ..backend.controller import BackendController
@@ -40,7 +41,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setWindowTitle("LAN Transfer")
-        self.setMinimumSize(1100, 720)
+        self.setMinimumSize(800, 400)
+
         self.config_store = config_store
         self.history_store = history_store
         self.backend = backend
@@ -55,23 +57,80 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._wire_callbacks()
 
+    # ---------------------------------------------------------------- UI
+
     def _build_ui(self) -> None:
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        # Simple modern theming
+        # Futuristic minimalist theme
         self.setStyleSheet(
             """
-            QWidget { font-family: 'Segoe UI'; font-size: 11pt; }
-            QTabWidget::pane { border: 1px solid #d0d7de; border-radius: 10px; padding: 6px; }
-            QTabBar::tab { background: #f6f8fa; border: 1px solid #d0d7de; padding: 10px 16px; border-radius: 8px; margin-right: 4px; }
-            QTabBar::tab:selected { background: #e9eff5; }
-            QPushButton { background: #0d6efd; color: white; border-radius: 8px; padding: 8px 14px; }
-            QPushButton:hover { background: #0b5ed7; }
-            QPushButton:pressed { background: #0a58ca; }
-            QListWidget, QTableWidget, QLineEdit, QComboBox { border: 1px solid #d0d7de; border-radius: 6px; padding: 6px; }
-            QProgressBar { border: 1px solid #d0d7de; border-radius: 6px; text-align: center; }
-            QProgressBar::chunk { background-color: #16a34a; border-radius: 6px; }
+            QWidget {
+                background-color: #0f1115;
+                color: #d1d5db;
+                font-family: "Inter", "Segoe UI", sans-serif;
+                font-size: 10.5pt;
+            }
+
+            QLabel { color: #9ca3af; }
+
+            QTabWidget::pane {
+                border: 1px solid #1f2933;
+                background: #0f1115;
+            }
+
+            QTabBar::tab {
+                background: #151821;
+                border: 1px solid #1f2933;
+                padding: 8px 14px;
+                margin-right: 4px;
+            }
+
+            QTabBar::tab:selected {
+                background: #1a1f2b;
+                border-bottom: 2px solid #3b82f6;
+            }
+
+            QPushButton {
+                background: #1a1f2b;
+                border: 1px solid #1f2933;
+                padding: 6px 12px;
+                border-radius: 6px;
+            }
+
+            QPushButton:hover { background: #202634; }
+
+            QLineEdit, QListWidget, QTableWidget {
+                background: #151821;
+                border: 1px solid #1f2933;
+                padding: 6px;
+            }
+
+            QListWidget::item:selected {
+                background: #1f2933;
+            }
+
+            QProgressBar {
+                background: #151821;
+                border: 1px solid #1f2933;
+                height: 14px;
+            }
+
+            QProgressBar::chunk {
+                background: #22c55e;
+            }
+
+            QCheckBox::indicator {
+                width: 36px;
+                height: 18px;
+                border-radius: 9px;
+                background: #1f2933;
+            }
+
+            QCheckBox::indicator:checked {
+                background: #3b82f6;
+            }
             """
         )
 
@@ -80,82 +139,125 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_transfers_tab(), "Transfers")
         self.tabs.addTab(self._build_history_tab(), "History")
 
+    # ---------------------------------------------------------------- Tabs
+
     def _build_main_tab(self) -> QWidget:
         container = QWidget()
         layout = QHBoxLayout(container)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
 
-        # Peers list
+        # Peers
         peer_layout = QVBoxLayout()
-        peer_layout.addWidget(QLabel("Available peers"))
+        peer_layout.addWidget(QLabel("Peers"))
         self.peer_list = QListWidget()
         self.peer_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
         self.peer_list.itemDoubleClicked.connect(self._toggle_peer_selection)
         peer_layout.addWidget(self.peer_list)
-        layout.addLayout(peer_layout)
 
-        # File selection
+        # Files
         file_layout = QVBoxLayout()
-        file_layout.addWidget(QLabel("Files to send"))
+        file_layout.addWidget(QLabel("Files"))
         self.file_list = QListWidget()
-        self.file_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
         self.file_list.itemDoubleClicked.connect(self._remove_file)
         file_layout.addWidget(self.file_list)
 
-        btn_row = QHBoxLayout()
-        add_btn = QPushButton("Add files")
+        btns = QHBoxLayout()
+        add_btn = QPushButton("Add")
         add_btn.clicked.connect(self._choose_files)
-        send_btn = QPushButton("Send to selected peers")
+        send_btn = QPushButton("Send")
         send_btn.clicked.connect(self._send_selected)
-        btn_row.addWidget(add_btn)
-        btn_row.addWidget(send_btn)
-        file_layout.addLayout(btn_row)
+        btns.addWidget(add_btn)
+        btns.addWidget(send_btn)
+        file_layout.addLayout(btns)
 
-        layout.addLayout(file_layout)
+        layout.addLayout(peer_layout, 1)
+        layout.addLayout(file_layout, 1)
         return container
 
     def _build_settings_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
+        layout.setSpacing(8)
+        layout.setContentsMargins(14, 14, 14, 14)
+        
 
         self.username_edit = QLineEdit(self.config.username)
-        self.status_combo = QComboBox()
-        self.status_combo.addItems(["available", "busy"])
-        self.status_combo.setCurrentText(self.config.status)
+
+        self.status_toggle = QCheckBox()
+        self.status_toggle.setChecked(self.config.status == "available")
+        self._update_status_toggle_label()
+        self.status_toggle.stateChanged.connect(self._update_status_toggle_label)
+
         self.download_edit = QLineEdit(str(self.config.download_dir))
-        choose_btn = QPushButton("Choose download folder")
+
+        choose_btn = QPushButton("Browse")
         choose_btn.clicked.connect(self._choose_download_dir)
-        save_btn = QPushButton("Save settings")
+
+        save_btn = QPushButton("Save")
         save_btn.clicked.connect(self._save_settings)
 
         layout.addWidget(QLabel("Username"))
         layout.addWidget(self.username_edit)
-        layout.addWidget(QLabel("Status"))
-        layout.addWidget(self.status_combo)
+        layout.addWidget(self.status_toggle)
         layout.addWidget(QLabel("Download folder"))
         layout.addWidget(self.download_edit)
         layout.addWidget(choose_btn)
         layout.addWidget(save_btn)
         layout.addStretch()
+
         return container
 
     def _build_transfers_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
         self.transfer_list = QListWidget()
-        layout.addWidget(QLabel("Active transfers"))
         layout.addWidget(self.transfer_list)
         return container
 
     def _build_history_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+
         self.history_table = QTableWidget(0, 5)
         self.history_table.setHorizontalHeaderLabels(
             ["Filename", "Size", "Peer", "Direction", "Status"]
         )
+
+        # --- Behavior (presentation-only) ---
+        self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.setShowGrid(False)
+
+        # --- Column sizing ---
+        header = self.history_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)          # Filename
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)          # Peer
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # Size
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # Direction
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents) # Status
+
+        # Keep status compact
+        self.history_table.setColumnWidth(4, 90)
+
         layout.addWidget(self.history_table)
+
         self._refresh_history_table()
         return container
+
+    # ---------------------------------------------------------------- Helpers
+
+    def _update_status_toggle_label(self) -> None:
+        self.status_toggle.setText(
+            "Available" if self.status_toggle.isChecked() else "Busy"
+        )
+
+    def _toggle_peer_selection(self, item: QListWidgetItem) -> None:
+        item.setSelected(not item.isSelected())
+
+    # ---------------------------------------------------------------- Wiring
 
     def _wire_callbacks(self) -> None:
         self.bridge.peer_discovered.connect(self._on_peer_discovered)
@@ -164,34 +266,30 @@ class MainWindow(QMainWindow):
         self.bridge.transfer_progress.connect(self._on_transfer_progress)
         self.bridge.transfer_result.connect(self._on_transfer_result)
 
-    # Event handlers
+    # ---------------------------------------------------------------- Events
+
     def _on_peer_discovered(self, peer: PeerInfo) -> None:
         self.peers[peer.peer_id] = peer
         self._refresh_peer_list()
 
     def _on_peer_lost(self, peer_id: str) -> None:
-        if peer_id in self.peers:
-            self.peers.pop(peer_id)
-            self._refresh_peer_list()
+        self.peers.pop(peer_id, None)
+        self._refresh_peer_list()
 
     def _on_transfer_offer(self, offer: TransferOffer) -> None:
         msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Icon.Question)
-        filenames = ", ".join([f.name for f in offer.files])
-        msg.setText(f"{offer.peer.name} wants to send: {filenames}\nAccept?")
+        msg.setText(f"{offer.peer.name} wants to send files. Accept?")
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        choice = msg.exec()
-        accept = choice == QMessageBox.StandardButton.Yes
-        self.backend.respond_to_offer(offer.request_id, accept)
+        self.backend.respond_to_offer(
+            offer.request_id, msg.exec() == QMessageBox.StandardButton.Yes
+        )
 
     def _on_transfer_progress(self, progress: TransferProgress) -> None:
         bar = self.transfer_bars.get(progress.transfer_id)
         if not bar:
             bar = QProgressBar()
             bar.setMaximum(progress.total_bytes)
-            widget = self._make_transfer_widget(
-                f"{progress.direction.capitalize()}: {progress.file.name} -> {progress.peer.name}", bar
-            )
+            widget = self._make_transfer_widget(progress.file.name, bar)
             item = QListWidgetItem()
             item.setSizeHint(widget.sizeHint())
             self.transfer_list.addItem(item)
@@ -211,58 +309,55 @@ class MainWindow(QMainWindow):
         )
         self.history_store.append(entry)
         self._refresh_history_table()
-        bar = self.transfer_bars.pop(result.transfer_id, None)
-        item = self.transfer_items.pop(result.transfer_id, None)
-        if item is not None:
-            idx = self.transfer_list.row(item)
-            if idx >= 0:
-                self.transfer_list.takeItem(idx)
 
-    # UI actions
+        self.transfer_bars.pop(result.transfer_id, None)
+        item = self.transfer_items.pop(result.transfer_id, None)
+        if item:
+            self.transfer_list.takeItem(self.transfer_list.row(item))
+
+    # ---------------------------------------------------------------- Actions
+
     def _refresh_peer_list(self) -> None:
         self.peer_list.clear()
         for peer in self.peers.values():
-            item = QListWidgetItem(f"{peer.name} ({peer.ip}) [{peer.status}]")
+            icon = "🟢" if peer.status == "available" else "🔴"
+            item = QListWidgetItem(f"{icon} {peer.name} ({peer.ip})")
             item.setData(Qt.ItemDataRole.UserRole, peer.peer_id)
             self.peer_list.addItem(item)
 
     def _choose_files(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(self, "Select files to send")
+        files, _ = QFileDialog.getOpenFileNames(self, "Select files")
         for path in files:
             p = Path(path)
             if p not in self.selected_files:
                 self.selected_files.append(p)
                 self.file_list.addItem(str(p))
 
-    def _toggle_peer_selection(self, item: QListWidgetItem) -> None:
-        item.setSelected(not item.isSelected())
-
     def _remove_file(self, item: QListWidgetItem) -> None:
         path = Path(item.text())
         self.selected_files = [p for p in self.selected_files if p != path]
-        row = self.file_list.row(item)
-        self.file_list.takeItem(row)
+        self.file_list.takeItem(self.file_list.row(item))
 
     def _send_selected(self) -> None:
-        selected_items = self.peer_list.selectedItems()
-        if not selected_items or not self.selected_files:
-            QMessageBox.information(self, "Select peers/files", "Pick peers and files first")
+        peers = self.peer_list.selectedItems()
+        if not peers or not self.selected_files:
+            QMessageBox.information(self, "Missing selection", "Select peers and files first")
             return
-        peer_ids = [i.data(Qt.ItemDataRole.UserRole) for i in selected_items]
-        for pid in peer_ids:
-            peer = self.peers.get(pid)
+        for item in peers:
+            peer = self.peers.get(item.data(Qt.ItemDataRole.UserRole))
             if peer:
                 self.backend.send_files(peer, self.selected_files)
 
     def _choose_download_dir(self) -> None:
-        dir_path = QFileDialog.getExistingDirectory(self, "Choose download folder", str(self.config.download_dir))
-        if dir_path:
-            self.download_edit.setText(dir_path)
+        path = QFileDialog.getExistingDirectory(self, "Download folder")
+        if path:
+            self.download_edit.setText(path)
 
     def _save_settings(self) -> None:
+        status = "available" if self.status_toggle.isChecked() else "busy"
         cfg = AppConfig(
             username=self.username_edit.text() or self.config.username,
-            status=self.status_combo.currentText(),
+            status=status,
             download_dir=Path(self.download_edit.text() or self.config.download_dir),
             udp_port=self.config.udp_port,
             tcp_port=self.config.tcp_port,
@@ -278,21 +373,21 @@ class MainWindow(QMainWindow):
     def _refresh_history_table(self) -> None:
         entries = self.history_store.load()
         self.history_table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            self.history_table.setItem(row, 0, QTableWidgetItem(entry.get("filename", "")))
-            self.history_table.setItem(row, 1, QTableWidgetItem(str(entry.get("size", ""))))
-            self.history_table.setItem(row, 2, QTableWidgetItem(entry.get("peer_name", "")))
-            self.history_table.setItem(row, 3, QTableWidgetItem(entry.get("direction", "")))
-            self.history_table.setItem(row, 4, QTableWidgetItem(entry.get("status", "")))
 
-    def _make_transfer_widget(self, label_text: str, bar: QProgressBar) -> QWidget:
-        container = QWidget()
-        v = QVBoxLayout(container)
-        v.setContentsMargins(6, 6, 6, 6)
-        v.setSpacing(4)
-        label = QLabel(label_text)
-        label.setStyleSheet("font-weight: 600;")
-        bar.setTextVisible(True)
-        v.addWidget(label)
-        v.addWidget(bar)
-        return container
+        for row, entry in enumerate(entries):
+            self.history_table.setItem(row, 0, QTableWidgetItem(entry["filename"]))
+            self.history_table.setItem(row, 1, QTableWidgetItem(str(entry["size"])))
+            self.history_table.setItem(row, 2, QTableWidgetItem(entry["peer_name"]))
+            self.history_table.setItem(row, 3, QTableWidgetItem(entry["direction"]))
+
+            status_item = QTableWidgetItem(entry["status"])
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.history_table.setItem(row, 4, status_item)
+
+    def _make_transfer_widget(self, name: str, bar: QProgressBar) -> QWidget:
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.setContentsMargins(4, 4, 4, 4)
+        l.addWidget(QLabel(name))
+        l.addWidget(bar)
+        return w
