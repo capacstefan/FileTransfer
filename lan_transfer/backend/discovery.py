@@ -42,8 +42,8 @@ class DiscoveryService:
         self._stop_event.set()
 
     def _broadcast_loop(self) -> None:
-        payload = f"LAN_XFER|{self.device_name}|{self.status}".encode()
         while not self._stop_event.is_set():
+            payload = f"LAN_XFER|{self.device_name}|{self.status}".encode()
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
                     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)

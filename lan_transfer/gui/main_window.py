@@ -40,6 +40,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setWindowTitle("LAN Transfer")
+        self.setMinimumSize(1100, 720)
         self.config_store = config_store
         self.history_store = history_store
         self.backend = backend
@@ -49,6 +50,7 @@ class MainWindow(QMainWindow):
         self.peers: Dict[str, PeerInfo] = {}
         self.selected_files: List[Path] = []
         self.transfer_bars: Dict[str, QProgressBar] = {}
+        self.transfer_items: Dict[str, QListWidgetItem] = {}
 
         self._build_ui()
         self._wire_callbacks()
@@ -56,6 +58,22 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
+
+        # Simple modern theming
+        self.setStyleSheet(
+            """
+            QWidget { font-family: 'Segoe UI'; font-size: 11pt; }
+            QTabWidget::pane { border: 1px solid #d0d7de; border-radius: 10px; padding: 6px; }
+            QTabBar::tab { background: #f6f8fa; border: 1px solid #d0d7de; padding: 10px 16px; border-radius: 8px; margin-right: 4px; }
+            QTabBar::tab:selected { background: #e9eff5; }
+            QPushButton { background: #0d6efd; color: white; border-radius: 8px; padding: 8px 14px; }
+            QPushButton:hover { background: #0b5ed7; }
+            QPushButton:pressed { background: #0a58ca; }
+            QListWidget, QTableWidget, QLineEdit, QComboBox { border: 1px solid #d0d7de; border-radius: 6px; padding: 6px; }
+            QProgressBar { border: 1px solid #d0d7de; border-radius: 6px; text-align: center; }
+            QProgressBar::chunk { background-color: #16a34a; border-radius: 6px; }
+            """
+        )
 
         self.tabs.addTab(self._build_main_tab(), "Main")
         self.tabs.addTab(self._build_settings_tab(), "Settings")
@@ -171,10 +189,15 @@ class MainWindow(QMainWindow):
         if not bar:
             bar = QProgressBar()
             bar.setMaximum(progress.total_bytes)
-            item = QListWidgetItem(f"{progress.direction}: {progress.file.name} -> {progress.peer.name}")
+            widget = self._make_transfer_widget(
+                f"{progress.direction.capitalize()}: {progress.file.name} -> {progress.peer.name}", bar
+            )
+            item = QListWidgetItem()
+            item.setSizeHint(widget.sizeHint())
             self.transfer_list.addItem(item)
-            self.transfer_list.setItemWidget(item, bar)
+            self.transfer_list.setItemWidget(item, widget)
             self.transfer_bars[progress.transfer_id] = bar
+            self.transfer_items[progress.transfer_id] = item
         bar.setValue(progress.bytes_transferred)
 
     def _on_transfer_result(self, result: TransferResult) -> None:
@@ -188,7 +211,12 @@ class MainWindow(QMainWindow):
         )
         self.history_store.append(entry)
         self._refresh_history_table()
-        self.transfer_bars.pop(result.transfer_id, None)
+        bar = self.transfer_bars.pop(result.transfer_id, None)
+        item = self.transfer_items.pop(result.transfer_id, None)
+        if item is not None:
+            idx = self.transfer_list.row(item)
+            if idx >= 0:
+                self.transfer_list.takeItem(idx)
 
     # UI actions
     def _refresh_peer_list(self) -> None:
@@ -256,3 +284,15 @@ class MainWindow(QMainWindow):
             self.history_table.setItem(row, 2, QTableWidgetItem(entry.get("peer_name", "")))
             self.history_table.setItem(row, 3, QTableWidgetItem(entry.get("direction", "")))
             self.history_table.setItem(row, 4, QTableWidgetItem(entry.get("status", "")))
+
+    def _make_transfer_widget(self, label_text: str, bar: QProgressBar) -> QWidget:
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+        label = QLabel(label_text)
+        label.setStyleSheet("font-weight: 600;")
+        bar.setTextVisible(True)
+        v.addWidget(label)
+        v.addWidget(bar)
+        return container
