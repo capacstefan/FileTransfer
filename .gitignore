@@ -1,30 +1,6 @@
-# Byte-compiled / cache files
+.venv/
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
-
-# Virtual environments
-.env
-.venv
-venv/
-env/
-
-# Editor / IDE
-.vscode/
-.idea/
-
-# OS
+*.pyc
+state/
+!state/.gitkeep
 .DS_Store
-Thumbs.db
-
-# Logs
-*.log
-logs/
-
-# User data
-Data/keys/
